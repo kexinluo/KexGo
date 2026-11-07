@@ -1,0 +1,692 @@
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use lofty::{Accessor, AudioFile, TaggedFileExt};
+use uuid::Uuid;
+
+use crate::models::{
+    AppSettings, ImportFailure, ImportSummary, LibraryFile, LibrarySnapshot, SaveLyricsResponse,
+    SaveLyricsResult, Track,
+};
+
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "wav", "ogg", "opus"];
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+
+#[derive(Default)]
+struct ImportedMetadata {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    duration: f64,
+    embedded_cover: Option<Vec<u8>>,
+}
+
+pub struct LibraryStore {
+    pub data_dir: PathBuf,
+    tracks: Vec<Track>,
+    settings: AppSettings,
+}
+
+impl LibraryStore {
+    pub fn load(data_dir: PathBuf) -> Result<Self, String> {
+        fs::create_dir_all(&data_dir).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
+        fs::create_dir_all(data_dir.join("lyrics")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(data_dir.join("covers")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(data_dir.join("drafts")).map_err(|error| error.to_string())?;
+
+        let library_path = data_dir.join("library.json");
+        let file = if library_path.exists() {
+            match fs::read_to_string(&library_path) {
+                Ok(text) => serde_json::from_str::<LibraryFile>(&text).unwrap_or_default(),
+                Err(_) => LibraryFile::default(),
+            }
+        } else {
+            LibraryFile::default()
+        };
+
+        let mut store = Self {
+            data_dir,
+            tracks: file.tracks,
+            settings: file.settings,
+        };
+        store.repair_paths();
+        store.persist()?;
+        Ok(store)
+    }
+
+    fn repair_paths(&mut self) {
+        for track in &mut self.tracks {
+            if let Some(path) = &track.cover_path {
+                if !Path::new(path).exists() {
+                    track.cover_path = None;
+                }
+            }
+            if let Some(path) = &track.lrc_path {
+                if !Path::new(path).exists() {
+                    track.lrc_path = None;
+                }
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> LibrarySnapshot {
+        LibrarySnapshot {
+            tracks: self.tracks.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    pub fn persist(&self) -> Result<(), String> {
+        let file = LibraryFile {
+            tracks: self.tracks.clone(),
+            settings: self.settings.clone(),
+        };
+        let json = serde_json::to_string_pretty(&file).map_err(|error| error.to_string())?;
+        fs::write(self.data_dir.join("library.json"), json)
+            .map_err(|error| format!("无法写入曲库：{error}"))
+    }
+
+    pub fn save_settings(&mut self, settings: AppSettings) -> Result<(), String> {
+        self.settings = settings;
+        self.persist()
+    }
+
+    pub fn update_track(
+        &mut self,
+        track_id: &str,
+        title: String,
+        artist: String,
+        album: String,
+    ) -> Result<Track, String> {
+        let now = now_ms();
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        track.title = if title.trim().is_empty() {
+            track.title.clone()
+        } else {
+            title.trim().to_string()
+        };
+        track.artist = if artist.trim().is_empty() {
+            "未知歌手".to_string()
+        } else {
+            artist.trim().to_string()
+        };
+        track.album = album.trim().to_string();
+        track.updated_at = now;
+        let updated = track.clone();
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub fn remove_track(&mut self, track_id: &str) -> Result<(), String> {
+        let position = self
+            .tracks
+            .iter()
+            .position(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        let track = self.tracks.remove(position);
+        if let Some(cover) = &track.cover_path {
+            let _ = fs::remove_file(cover);
+        }
+        if let Some(lrc) = &track.lrc_path {
+            let _ = fs::remove_file(lrc);
+        }
+        if self.settings.last_track_id.as_deref() == Some(track_id) {
+            self.settings.last_track_id = self.tracks.first().map(|item| item.id.clone());
+            self.settings.last_position = 0.0;
+        }
+        self.persist()
+    }
+
+    pub fn track_path(&self, track_id: &str) -> Result<PathBuf, String> {
+        self.tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| PathBuf::from(&track.file_path))
+            .ok_or_else(|| "歌曲不存在".to_string())
+    }
+
+    pub fn import_paths(&mut self, paths: Vec<PathBuf>) -> ImportSummary {
+        let mut summary = ImportSummary {
+            added: Vec::new(),
+            skipped: Vec::new(),
+            failed: Vec::new(),
+        };
+        let has_audio_candidate = paths.iter().any(|path| is_audio_file(path));
+
+        for path in paths {
+            if !is_audio_file(&path) {
+                // Sidecar LRCs and cover images commonly arrive in the same drop.
+                // They are handled by directory detection; only complain when the
+                // drop contained no audio at all.
+                if !has_audio_candidate && path.is_file() {
+                    summary.failed.push(ImportFailure {
+                        path: path.display().to_string(),
+                        reason: "不是受支持的音频文件".to_string(),
+                    });
+                }
+                continue;
+            }
+            let normalized = path.to_string_lossy().to_string();
+            if self
+                .tracks
+                .iter()
+                .any(|track| paths_equal(&track.file_path, &normalized))
+            {
+                summary.skipped.push(
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                continue;
+            }
+            match self.import_one(&path) {
+                Ok(track) => summary.added.push(track),
+                Err(error) => summary.failed.push(ImportFailure {
+                    path: normalized,
+                    reason: error,
+                }),
+            }
+        }
+
+        if !summary.added.is_empty() {
+            if let Err(error) = self.persist() {
+                summary.failed.push(ImportFailure {
+                    path: String::new(),
+                    reason: error,
+                });
+                summary.added.clear();
+            }
+        }
+        summary
+    }
+
+    fn import_one(&mut self, path: &Path) -> Result<Track, String> {
+        if !path.exists() {
+            return Err("文件不存在或已被移动".to_string());
+        }
+        let file_stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未命名歌曲".to_string());
+        let metadata = read_metadata(path);
+        let (fallback_artist, fallback_title) = title_artist_from_filename(&file_stem);
+        let id = Uuid::new_v4().to_string();
+        let now = now_ms();
+
+        let (lrc_source, lyrics_text) = match find_sidecar_lrc(path) {
+            Some(lrc_path) => match read_text_any_encoding(&lrc_path) {
+                Ok(text) => (Some(lrc_path), text),
+                Err(_) => (None, String::new()),
+            },
+            None => (None, String::new()),
+        };
+
+        let mut lrc_path: Option<String> = None;
+        if lrc_source.is_some() {
+            let managed = self.data_dir.join("lyrics").join(format!("{id}.lrc"));
+            if fs::write(&managed, lyrics_text.as_bytes()).is_ok() {
+                lrc_path = Some(managed.to_string_lossy().to_string());
+            }
+        }
+
+        let sidecar_cover = find_sidecar_cover(path);
+        let mut cover_path: Option<String> = None;
+        if let Some(cover_source) = sidecar_cover {
+            cover_path = self.copy_cover_from_file(&id, &cover_source);
+        }
+        if cover_path.is_none() {
+            if let Some(bytes) = metadata.embedded_cover.as_ref() {
+                cover_path = self.copy_embedded_cover(&id, bytes);
+            }
+        }
+
+        let duration = if metadata.duration > 0.0 {
+            metadata.duration
+        } else {
+            probe_duration(path).unwrap_or(0.0)
+        };
+
+        let title = metadata
+            .title
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(fallback_title);
+        let artist = metadata
+            .artist
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(fallback_artist);
+        let album = metadata.album.unwrap_or_default();
+
+        let track = Track {
+            id,
+            file_path: path.to_string_lossy().to_string(),
+            title,
+            artist,
+            album,
+            duration,
+            cover_path,
+            lrc_path: lrc_path.clone(),
+            lyrics_text,
+            lyrics_origin: if lrc_path.is_some() {
+                "sidecar".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        self.tracks.push(track.clone());
+        Ok(track)
+    }
+
+    fn copy_cover_from_file(&self, id: &str, source: &Path) -> Option<String> {
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| IMAGE_EXTENSIONS.contains(&value.as_str()))
+            .unwrap_or_else(|| "jpg".to_string());
+        let destination = self
+            .data_dir
+            .join("covers")
+            .join(format!("{id}.{extension}"));
+        fs::copy(source, &destination).ok()?;
+        Some(destination.to_string_lossy().to_string())
+    }
+
+    fn copy_embedded_cover(&self, id: &str, bytes: &[u8]) -> Option<String> {
+        let extension = image_extension(bytes);
+        let destination = self
+            .data_dir
+            .join("covers")
+            .join(format!("{id}.{extension}"));
+        fs::write(&destination, bytes).ok()?;
+        Some(destination.to_string_lossy().to_string())
+    }
+
+    pub fn track(&self, track_id: &str) -> Option<Track> {
+        self.tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .cloned()
+    }
+
+    pub fn pick_lrc_for_track(&mut self, track_id: &str) -> Result<Option<Track>, String> {
+        let file = rfd::FileDialog::new()
+            .add_filter("LRC 歌词", &["lrc", "txt"])
+            .set_title("选择 LRC 歌词")
+            .pick_file();
+        let Some(path) = file else {
+            return Ok(None);
+        };
+        let text = read_text_any_encoding(&path)?;
+        if text.trim().is_empty() {
+            return Err("这个歌词文件是空的".to_string());
+        }
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        let managed = self
+            .data_dir
+            .join("lyrics")
+            .join(format!("{}.lrc", track.id));
+        fs::write(&managed, normalize_newlines(&text))
+            .map_err(|error| format!("无法写入歌词：{error}"))?;
+        track.lyrics_text = normalize_newlines(&text);
+        track.lrc_path = Some(managed.to_string_lossy().to_string());
+        track.lyrics_origin = "sidecar".to_string();
+        track.updated_at = now_ms();
+        let updated = track.clone();
+        self.persist()?;
+        Ok(Some(updated))
+    }
+
+    pub fn pick_cover_for_track(&mut self, track_id: &str) -> Result<Option<Track>, String> {
+        let file = rfd::FileDialog::new()
+            .add_filter("图片", &["jpg", "jpeg", "png", "webp", "gif"])
+            .set_title("选择封面图片")
+            .pick_file();
+        let Some(path) = file else {
+            return Ok(None);
+        };
+        let (track_id_value, old_cover) = self
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(|track| (track.id.clone(), track.cover_path.clone()))
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        let cover = self
+            .copy_cover_from_file(&track_id_value, &path)
+            .ok_or_else(|| "无法复制封面图片".to_string())?;
+        if let Some(old_cover) = old_cover {
+            let _ = fs::remove_file(old_cover);
+        }
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        track.cover_path = Some(cover);
+        track.updated_at = now_ms();
+        let updated = track.clone();
+        self.persist()?;
+        Ok(Some(updated))
+    }
+
+    pub fn cover_data_url(&self, track_id: &str) -> Result<Option<String>, String> {
+        let track = self
+            .tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        let Some(path) = &track.cover_path else {
+            return Ok(None);
+        };
+        let bytes = fs::read(path).map_err(|error| format!("无法读取封面：{error}"))?;
+        let mime = match image_extension(&bytes) {
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "image/jpeg",
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Ok(Some(format!("data:{mime};base64,{encoded}")))
+    }
+
+    pub fn set_plain_lyrics(
+        &mut self,
+        track_id: &str,
+        text: String,
+        origin: String,
+    ) -> Result<Track, String> {
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        track.lyrics_text = normalize_newlines(&text);
+        track.lrc_path = None;
+        track.lyrics_origin = normalize_origin(&origin);
+        track.updated_at = now_ms();
+        let updated = track.clone();
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub fn save_lyrics(
+        &mut self,
+        track_id: &str,
+        content: String,
+        origin: String,
+        write_sidecar: bool,
+    ) -> Result<SaveLyricsResponse, String> {
+        if content.trim().is_empty() {
+            return Err("歌词内容为空".to_string());
+        }
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        let normalized = normalize_newlines(&content);
+        let managed = self
+            .data_dir
+            .join("lyrics")
+            .join(format!("{}.lrc", track.id));
+        fs::write(&managed, normalized.as_bytes())
+            .map_err(|error| format!("无法保存 LRC：{error}"))?;
+
+        let mut sidecar_path = None;
+        let mut warning = None;
+        if write_sidecar {
+            let audio_path = PathBuf::from(&track.file_path);
+            if let Some(parent) = audio_path.parent() {
+                let file_name = audio_path
+                    .file_stem()
+                    .map(|stem| format!("{}.lrc", stem.to_string_lossy()))
+                    .unwrap_or_else(|| format!("{}.lrc", track.title));
+                let target = parent.join(file_name);
+                match fs::write(&target, normalized.as_bytes()) {
+                    Ok(_) => sidecar_path = Some(target.to_string_lossy().to_string()),
+                    Err(error) => {
+                        warning = Some(format!("无法写入歌曲同目录 .lrc：{error}"));
+                    }
+                }
+            }
+        }
+
+        track.lyrics_text = normalized;
+        track.lrc_path = Some(managed.to_string_lossy().to_string());
+        track.lyrics_origin = normalize_origin(&origin);
+        track.updated_at = now_ms();
+        let updated = track.clone();
+        self.persist()?;
+
+        Ok(SaveLyricsResponse {
+            track: updated,
+            result: SaveLyricsResult {
+                lrc_path: managed.to_string_lossy().to_string(),
+                sidecar_path,
+                warning,
+            },
+        })
+    }
+
+    pub fn export_path_suggestion(&self, track_id: &str, suggested_name: &str) -> Option<PathBuf> {
+        let track = self.tracks.iter().find(|track| track.id == track_id)?;
+        let audio = PathBuf::from(&track.file_path);
+        let parent = audio.parent()?;
+        Some(parent.join(suggested_name))
+    }
+
+    pub fn settings(&self) -> &AppSettings {
+        &self.settings
+    }
+}
+
+fn read_metadata(path: &Path) -> ImportedMetadata {
+    let mut metadata = ImportedMetadata::default();
+    let Ok(tagged) = lofty::read_from_path(path) else {
+        return metadata;
+    };
+    let duration = tagged.properties().duration();
+    metadata.duration = duration.as_secs_f64();
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
+    if let Some(tag) = tag {
+        metadata.title = tag.title().map(|value| value.to_string());
+        metadata.artist = tag.artist().map(|value| value.to_string());
+        metadata.album = tag.album().map(|value| value.to_string());
+        if let Some(picture) = tag.pictures().first() {
+            metadata.embedded_cover = Some(picture.data().to_vec());
+        }
+    }
+    metadata
+}
+
+pub fn probe_duration(path: &Path) -> Option<f64> {
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = fs::File::open(path).ok()?;
+    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            source,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let track = probed.format.default_track()?;
+    let time_base = track.codec_params.time_base?;
+    let frames = track.codec_params.n_frames?;
+    let time = time_base.calc_time(frames);
+    Some(time.seconds as f64 + time.frac)
+}
+
+pub fn read_text_any_encoding(path: &Path) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .map_err(|error| format!("无法读取歌词文件：{error}"))?;
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8(bytes[3..].to_vec()).map_err(|_| "歌词编码无法识别".to_string());
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let mut utf16 = Vec::with_capacity((bytes.len() - 2) / 2);
+        for chunk in bytes[2..].chunks_exact(2) {
+            utf16.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        return String::from_utf16(&utf16).map_err(|_| "UTF-16 歌词解码失败".to_string());
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let mut utf16 = Vec::with_capacity((bytes.len() - 2) / 2);
+        for chunk in bytes[2..].chunks_exact(2) {
+            utf16.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+        return String::from_utf16(&utf16).map_err(|_| "UTF-16 歌词解码失败".to_string());
+    }
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(text.to_string());
+    }
+    let (decoded, _, _) = encoding_rs::GB18030.decode(&bytes);
+    Ok(decoded.into_owned())
+}
+
+fn find_sidecar_lrc(audio: &Path) -> Option<PathBuf> {
+    let parent = audio.parent()?;
+    let stem = audio.file_stem()?.to_string_lossy().to_lowercase();
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let matches_stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_lowercase() == stem)
+            .unwrap_or(false);
+        let is_lrc = path
+            .extension()
+            .map(|value| value.to_string_lossy().eq_ignore_ascii_case("lrc"))
+            .unwrap_or(false);
+        if matches_stem && is_lrc {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_sidecar_cover(audio: &Path) -> Option<PathBuf> {
+    let parent = audio.parent()?;
+    let stem = audio.file_stem()?.to_string_lossy().to_lowercase();
+    let entries = fs::read_dir(parent).ok()?.flatten();
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase());
+        if !extension
+            .as_deref()
+            .map(|value| IMAGE_EXTENSIONS.contains(&value))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let file_stem = path
+            .file_stem()
+            .map(|value| value.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let priority = if file_stem == stem {
+            0
+        } else if matches!(file_stem.as_str(), "cover" | "folder" | "front") {
+            1
+        } else {
+            continue;
+        };
+        candidates.push((priority, path));
+    }
+    candidates.sort_by_key(|(priority, _)| *priority);
+    candidates.into_iter().map(|(_, path)| path).next()
+}
+
+fn title_artist_from_filename(stem: &str) -> (String, String) {
+    let normalized = stem.replace('_', " ");
+    let parts: Vec<&str> = normalized.split(" - ").collect();
+    if parts.len() >= 2 {
+        (
+            parts[0].trim().to_string(),
+            parts[1..].join(" - ").trim().to_string(),
+        )
+    } else {
+        ("未知歌手".to_string(), normalized.trim().to_string())
+    }
+}
+
+fn image_extension(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else if bytes.starts_with(b"GIF8") {
+        "gif"
+    } else {
+        "jpg"
+    }
+}
+
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn normalize_origin(origin: &str) -> String {
+    match origin {
+        "sidecar" | "embedded" | "lrclib" | "manual" => origin.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| AUDIO_EXTENSIONS.contains(&value.to_ascii_lowercase().as_str()))
+            .unwrap_or(false)
+}
+
+fn paths_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
