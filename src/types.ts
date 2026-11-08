@@ -1,4 +1,87 @@
 export type LyricsOrigin = 'sidecar' | 'embedded' | 'lrclib' | 'manual' | 'unknown'
+export type PlayMode = 'sequential' | 'repeat-one' | 'shuffle'
+export type LibrarySortMode = 'custom' | 'title' | 'artist' | 'playCount'
+export type ThemeMode = 'dark' | 'light' | 'system'
+export type PauseMode = 'instant' | 'fade'
+export type AnnotationMode = 'none' | 'ruby' | 'romaji'
+
+export type ShortcutAction =
+  | 'playPause'
+  | 'previous'
+  | 'next'
+  | 'volumeUp'
+  | 'volumeDown'
+  | 'seekBack5'
+  | 'seekForward5'
+  | 'seekBack10'
+  | 'seekForward10'
+  | 'speedHold'
+  | 'speedToggle'
+  | 'speedUp'
+  | 'speedDown'
+  | 'alignPause'
+  | 'alignMark'
+  | 'alignBack'
+  | 'alignForward'
+  | 'alignUndo'
+  | 'alignRewind'
+  | 'alignSave'
+
+export type ContextMenuAction = 'play' | 'queue' | 'edit' | 'remove'
+
+export interface AppPreferences {
+  primaryColor: string
+  secondaryColor: string
+  uiFont: string
+  lyricsFont: string
+  languageFonts: {
+    han: string
+    latin: string
+    japanese: string
+    korean: string
+  }
+  shortcuts: Record<ShortcutAction, string>
+  contextMenu: { id: ContextMenuAction; visible: boolean }[]
+  pauseMode: PauseMode
+  pauseFadeMs: number
+  customCssEnabled: boolean
+  showTranslations: boolean
+  annotationMode: AnnotationMode
+  layout: {
+    showSidebar: boolean
+    showCover: boolean
+    showTags: boolean
+    showLyrics: boolean
+    sidebarWidth: number
+    coverScale: number
+  }
+}
+
+export interface LyricsNoteLine {
+  index: number
+  translation: string
+  ruby: string
+  romaji: string
+}
+
+export interface LyricsNotesFile {
+  version: 1
+  trackId: string
+  updatedAt: number
+  lines: LyricsNoteLine[]
+}
+
+export interface DataLocation {
+  current: string
+  default: string
+  customCssPath: string
+}
+
+export interface MigrationResult {
+  oldPath: string
+  newPath: string
+  restartRequired: boolean
+}
 
 export interface Track {
   id: string
@@ -11,6 +94,9 @@ export interface Track {
   lrcPath: string | null
   lyricsText: string
   lyricsOrigin: LyricsOrigin
+  tags: string[]
+  playCount: number
+  pauseFade: boolean
   createdAt: number
   updatedAt: number
 }
@@ -20,6 +106,40 @@ export interface AppSettings {
   lastPosition: number
   volume: number
   compensationMs: number
+  queue: string[] | null
+  playMode: PlayMode
+  sortMode: LibrarySortMode
+  libraryOrder: string[]
+  theme: ThemeMode
+  closeToTray: boolean
+  lyricsFontSize: number
+  visualizerEnabled: boolean
+  preferences: AppPreferences
+}
+
+export interface PlaylistTrackSnapshot {
+  trackId: string
+  title: string
+  artist: string
+  album: string
+  duration: number
+  fileName: string
+  tags: string[]
+}
+
+export interface PlaylistFile {
+  kind: 'kexgo-playlist'
+  schemaVersion: 1
+  exportedAt: string
+  playMode: PlayMode
+  tracks: PlaylistTrackSnapshot[]
+}
+
+export interface PlaylistMatch {
+  matched: { entry: PlaylistTrackSnapshot; track: Track }[]
+  unmatched: PlaylistTrackSnapshot[]
+  queue: string[]
+  tagUpdates: { trackId: string; tags: string[] }[]
 }
 
 export interface LibrarySnapshot {
@@ -27,10 +147,28 @@ export interface LibrarySnapshot {
   settings: AppSettings
 }
 
+export interface ImportIssue {
+  path: string
+  reason: string
+}
+
+export type TrackIssueStatus = 'missing' | 'unreadable' | 'undecodable' | 'duration-unknown' | 'unsupported'
+
+export interface TrackIssue {
+  trackId: string
+  status: TrackIssueStatus
+  message: string
+}
+
+export interface TrackCheck {
+  status: 'ok' | TrackIssueStatus
+  message: string
+}
+
 export interface ImportSummary {
   added: Track[]
   skipped: string[]
-  failed: { path: string; reason: string }[]
+  failed: ImportIssue[]
 }
 
 export interface LyricsQuery {

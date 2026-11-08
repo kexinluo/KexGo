@@ -1,30 +1,98 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useApp } from '../stores/app'
+import type { LibrarySortMode } from '../types'
+import { filterTracksByTags, sortLibraryTracks } from '../utils/library'
+import type { Track } from '../types'
 import { formatClock } from '../utils/time'
 import AppIcon from './AppIcon.vue'
 import CoverArt from './CoverArt.vue'
+import TrackContextMenu from './TrackContextMenu.vue'
 
 const emit = defineEmits<{ (event: 'import'): void }>()
-const { state, currentTrack, currentCover, selectTrack } = useApp()
+const {
+  state,
+  currentTrack,
+  currentCover,
+  selectTrack,
+  tagHistory,
+  toggleTagFilter,
+  clearTagFilters,
+  addTracksToQueue,
+  setSortMode,
+  moveLibraryItem
+} = useApp()
 
 const query = ref('')
 const searchInput = ref<HTMLInputElement | null>(null)
+const tagFilterOpen = ref(false)
+const contextMenu = ref<{ track: Track; x: number; y: number } | null>(null)
+let dragTrackId: string | null = null
+let lastDragAt = 0
 
 const filteredTracks = computed(() => {
   const needle = query.value.trim().toLocaleLowerCase()
-  if (!needle) return state.tracks
-  return state.tracks.filter((track) =>
-    `${track.title} ${track.artist} ${track.album}`.toLocaleLowerCase().includes(needle)
+  const searched = needle
+    ? state.tracks.filter((track) =>
+        `${track.title} ${track.artist} ${track.album}`.toLocaleLowerCase().includes(needle)
+      )
+    : state.tracks
+  return sortLibraryTracks(
+    filterTracksByTags(searched, state.selectedTags),
+    state.sortMode,
+    state.libraryOrder
   )
 })
+
+function onSortChange(event: Event): void {
+  setSortMode((event.target as HTMLSelectElement).value as LibrarySortMode)
+}
+
+function addFilteredToQueue(): void {
+  addTracksToQueue(filteredTracks.value.map((track) => track.id), true)
+}
+
+function clearFilters(): void {
+  query.value = ''
+  clearTagFilters()
+}
 
 function coverFor(trackId: string): string | null {
   return state.coverUrls[trackId] ?? null
 }
 
 function onRowClick(track: (typeof state.tracks)[number]): void {
+  if (Date.now() - lastDragAt < 220) return
   void selectTrack(track)
+}
+
+function onLibraryDragStart(track: (typeof state.tracks)[number], event: DragEvent): void {
+  if (state.sortMode !== 'custom') {
+    event.preventDefault()
+    return
+  }
+  dragTrackId = track.id
+  lastDragAt = Date.now()
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', track.id)
+  }
+}
+
+function onLibraryDrop(track: (typeof state.tracks)[number]): void {
+  if (!dragTrackId || dragTrackId === track.id) return
+  moveLibraryItem(dragTrackId, track.id)
+  dragTrackId = null
+  lastDragAt = Date.now()
+}
+
+function onLibraryDragEnd(): void {
+  dragTrackId = null
+  lastDragAt = Date.now()
+}
+
+function openContextMenu(track: Track, event: MouseEvent): void {
+  contextMenu.value = { track, x: event.clientX, y: event.clientY }
 }
 
 function focusSearch(): void {
@@ -62,6 +130,57 @@ defineExpose({ focusSearch })
       <kbd v-else>/</kbd>
     </label>
 
+    <div class="collection-controls">
+      <label class="sort-control">
+        <span>排序</span>
+        <select :value="state.sortMode" aria-label="曲库排序" @change="onSortChange">
+          <option value="custom">自定义顺序</option>
+          <option value="title">标题</option>
+          <option value="artist">歌手</option>
+          <option value="playCount">播放次数</option>
+        </select>
+        <AppIcon name="chevron" :size="11" />
+      </label>
+      <button
+        class="filter-toggle"
+        :class="{ active: state.selectedTags.length > 0 }"
+        :aria-expanded="tagFilterOpen"
+        @click="tagFilterOpen = !tagFilterOpen"
+      >
+        <AppIcon name="filter" :size="13" />
+        标签
+        <span v-if="state.selectedTags.length" class="filter-count">{{ state.selectedTags.length }}</span>
+      </button>
+    </div>
+
+    <div v-if="tagFilterOpen" class="tag-panel">
+      <div v-if="tagHistory.length" class="tag-options">
+        <button
+          v-for="tag in tagHistory"
+          :key="tag"
+          class="filter-chip"
+          :class="{ active: state.selectedTags.includes(tag) }"
+          @click="toggleTagFilter(tag)"
+        >
+          {{ tag }}
+        </button>
+      </div>
+      <p v-else class="no-tags">还没有标签，可在歌曲下方添加。</p>
+      <button v-if="state.selectedTags.length" class="clear-filters" @click="clearTagFilters">清除标签筛选</button>
+    </div>
+
+    <div class="collection-actions">
+      <span>
+        {{ filteredTracks.length }} 首
+        <template v-if="state.sortMode === 'custom' && filteredTracks.length > 1"> · 拖动排序</template>
+        <template v-if="state.selectedTags.length"> · {{ state.selectedTags.join(' + ') }}</template>
+      </span>
+      <button class="queue-add" :disabled="!filteredTracks.length" @click="addFilteredToQueue">
+        <AppIcon name="queue" :size="12" />
+        加入队列
+      </button>
+    </div>
+
     <div class="track-scroll">
       <TransitionGroup v-if="filteredTracks.length" name="track" tag="div" class="track-list">
         <button
@@ -69,7 +188,14 @@ defineExpose({ focusSearch })
           :key="track.id"
           class="track-row"
           :class="{ active: currentTrack?.id === track.id }"
+          :title="`${track.artist} · 播放 ${track.playCount ?? 0} 次`"
+          :draggable="state.sortMode === 'custom'"
           @click="onRowClick(track)"
+          @contextmenu.prevent="openContextMenu(track, $event)"
+          @dragstart="onLibraryDragStart(track, $event)"
+          @dragover.prevent
+          @drop.prevent="onLibraryDrop(track)"
+          @dragend="onLibraryDragEnd"
         >
           <span class="track-index">
             <span v-if="currentTrack?.id === track.id && state.playing" class="playing-bars" aria-label="正在播放">
@@ -89,7 +215,15 @@ defineExpose({ focusSearch })
             <span>{{ track.artist }}</span>
           </span>
           <span class="track-side">
-            <span v-if="track.lyricsText" class="lyric-dot" title="已有歌词"></span>
+            <span
+              v-if="state.trackIssues[track.id]"
+              class="issue-dot"
+              :title="state.trackIssues[track.id].message"
+              aria-label="文件不可用"
+            >
+              <AppIcon name="alert-triangle" :size="11" />
+            </span>
+            <span v-else-if="track.lyricsText" class="lyric-dot" title="已有歌词"></span>
             <span class="duration">{{ formatClock(track.duration) }}</span>
           </span>
         </button>
@@ -103,7 +237,7 @@ defineExpose({ focusSearch })
 
       <div v-else class="sidebar-empty compact">
         <p>没有匹配的歌曲</p>
-        <button class="text-button" @click="query = ''">清除搜索</button>
+        <button class="text-button" @click="clearFilters">清除筛选</button>
       </div>
     </div>
 
@@ -111,18 +245,27 @@ defineExpose({ focusSearch })
       <span class="hint-dot"></span>
       <p>拖入音频文件即可加入曲库<br /><span>MP3 · FLAC · M4A · WAV</span></p>
     </div>
+
+    <TrackContextMenu
+      v-if="contextMenu"
+      :track="contextMenu.track"
+      source="library"
+      :x="contextMenu.x"
+      :y="contextMenu.y"
+      @close="contextMenu = null"
+    />
   </aside>
 </template>
 
 <style scoped>
 .sidebar {
-  width: 310px;
-  flex: 0 0 310px;
+  width: var(--sidebar-width, 310px);
+  flex: 0 0 var(--sidebar-width, 310px);
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--line);
   min-height: 0;
-  background: rgb(15 17 15 / 62%);
+  background: var(--sidebar-bg);
 }
 
 .sidebar-heading {
@@ -218,6 +361,171 @@ defineExpose({ focusSearch })
   color: var(--text);
 }
 
+.collection-controls {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 16px 8px;
+}
+
+.sort-control {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 29px;
+  padding: 0 8px;
+  color: var(--faint);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 8px;
+}
+
+.sort-control select {
+  appearance: none;
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.sort-control select option {
+  color: var(--text);
+  background: var(--panel-bg);
+}
+
+.sort-control .app-icon {
+  pointer-events: none;
+  transform: rotate(90deg);
+}
+
+.filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 29px;
+  padding: 0 8px;
+  color: var(--faint);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 8.5px;
+  transition: color 160ms ease, border-color 160ms ease;
+}
+
+.filter-toggle:hover,
+.filter-toggle.active {
+  color: var(--accent-text);
+  border-color: rgb(200 245 106 / 20%);
+}
+
+.filter-count {
+  display: grid;
+  place-items: center;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  color: var(--accent-text);
+  background: rgb(200 245 106 / 8%);
+  border-radius: 7px;
+  font-family: var(--font-mono);
+  font-size: 6.5px;
+}
+
+.tag-panel {
+  margin: 0 16px 8px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgb(255 255 255 / 1.6%);
+}
+
+.tag-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 110px;
+  overflow-y: auto;
+}
+
+.filter-chip {
+  height: 21px;
+  padding: 0 7px;
+  color: var(--faint);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 8px;
+  transition: color 150ms ease, border-color 150ms ease, background 150ms ease;
+}
+
+.filter-chip:hover { color: var(--muted); }
+
+.filter-chip.active {
+  color: var(--accent-text);
+  border-color: rgb(200 245 106 / 25%);
+  background: rgb(200 245 106 / 6%);
+}
+
+.no-tags {
+  margin: 1px 0;
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.clear-filters {
+  margin-top: 7px;
+  color: var(--faint);
+  font-size: 8px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.clear-filters:hover { color: var(--muted); }
+
+.collection-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 16px 9px;
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.collection-actions > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: 23px;
+  padding: 0 7px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 8px;
+  transition: color 150ms ease, border-color 150ms ease;
+}
+
+.queue-add:hover:not(:disabled) {
+  color: var(--accent-text);
+  border-color: rgb(200 245 106 / 20%);
+}
+
+.queue-add:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
 .track-scroll {
   flex: 1;
   overflow-y: auto;
@@ -231,6 +539,14 @@ defineExpose({ focusSearch })
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+.track-row[draggable='true'] {
+  cursor: grab;
+}
+
+.track-row[draggable='true']:active {
+  cursor: grabbing;
 }
 
 .track-row {
@@ -281,7 +597,7 @@ defineExpose({ focusSearch })
 }
 
 .track-row.active .track-index {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .playing-bars {
@@ -364,6 +680,12 @@ defineExpose({ focusSearch })
   background: rgb(200 245 106 / 48%);
 }
 
+.issue-dot {
+  display: grid;
+  place-items: center;
+  color: var(--sand);
+}
+
 .duration {
   width: 32px;
   text-align: right;
@@ -404,7 +726,7 @@ defineExpose({ focusSearch })
 .text-button {
   margin-top: 9px;
   font-size: 11px;
-  color: var(--accent);
+  color: var(--accent-text);
   border-bottom: 1px solid rgb(200 245 106 / 24%);
   padding-bottom: 2px;
 }

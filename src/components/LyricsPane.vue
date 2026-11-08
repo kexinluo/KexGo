@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import { useApp } from '../stores/app'
+import { detectScript } from '../utils/language'
 import AppIcon from './AppIcon.vue'
+import RubyText from './RubyText.vue'
 
 const {
   state,
@@ -10,6 +12,7 @@ const {
   timedLines,
   activeLyricIndex,
   openLyricsModal,
+  openLyricsNotes,
   openAlignment,
   pickLrc,
   seekTo
@@ -100,6 +103,27 @@ function onLineClick(index: number, timeMs: number | null): void {
 function startAligning(): void {
   openAlignment(hasLyrics.value && !hasTimed.value ? currentTrack.value?.lyricsText : undefined)
 }
+
+function noteFor(index: number) {
+  return state.lyricsNotes?.lines.find((line) => line.index === index)
+}
+
+function rubyFor(index: number, text: string): string {
+  if (state.preferences.annotationMode !== 'ruby') return ''
+  if (detectScript(text) !== 'ja') return ''
+  return noteFor(index)?.ruby ?? ''
+}
+
+function romajiFor(index: number, text: string): string {
+  if (state.preferences.annotationMode !== 'romaji') return ''
+  const script = detectScript(text)
+  if (script !== 'ja' && script !== 'ko') return ''
+  return noteFor(index)?.romaji ?? ''
+}
+
+function translationFor(index: number): string {
+  return state.preferences.showTranslations ? noteFor(index)?.translation ?? '' : ''
+}
 </script>
 
 <template>
@@ -116,6 +140,10 @@ function startAligning(): void {
         <button class="subtle-button" @click="openLyricsModal">
           <AppIcon name="sparkles" :size="14" />
           <span>找词</span>
+        </button>
+        <button v-if="currentTrack" class="subtle-button" title="编辑翻译与注音" @click="openLyricsNotes">
+          <AppIcon name="globe" :size="14" />
+          <span>翻译/注音</span>
         </button>
         <button v-if="currentTrack" class="subtle-button" title="选择本地 LRC" @click="pickLrc">
           <AppIcon name="file-text" :size="14" />
@@ -148,15 +176,27 @@ function startAligning(): void {
             :key="line.id"
             :ref="(el) => setLineRef(el, index)"
             class="lyric-line"
-            :class="{
-              active: hasTimed && index === activeLyricIndex,
-              passed: hasTimed && activeLyricIndex >= 0 && index < activeLyricIndex,
-              clickable: line.timeMs !== null
-            }"
+            :class="[
+              `lang-${detectScript(line.text)}`,
+              {
+                active: hasTimed && index === activeLyricIndex,
+                passed: hasTimed && activeLyricIndex >= 0 && index < activeLyricIndex,
+                clickable: line.timeMs !== null
+              }
+            ]"
             @click="onLineClick(index, line.timeMs)"
           >
             <span v-if="hasTimed && index === activeLyricIndex" class="active-mark" aria-hidden="true"></span>
-            <span>{{ line.text }}</span>
+            <span class="lyric-main">
+              <RubyText v-if="rubyFor(index, line.text)" :text="rubyFor(index, line.text)" />
+              <template v-else>{{ line.text }}</template>
+            </span>
+            <span v-if="romajiFor(index, line.text)" class="lyric-annotation">
+              {{ romajiFor(index, line.text) }}
+            </span>
+            <span v-if="translationFor(index)" class="lyric-translation">
+              {{ translationFor(index) }}
+            </span>
           </button>
           <div class="lyrics-tail" aria-hidden="true">
             <span>KexGo</span>
@@ -287,7 +327,7 @@ function startAligning(): void {
 }
 
 .align-button {
-  color: var(--accent);
+  color: var(--accent-text);
   border-color: rgb(200 245 106 / 18%);
   background: rgb(200 245 106 / 5%);
 }
@@ -319,7 +359,7 @@ function startAligning(): void {
 }
 
 .unsynced-icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .unsynced-banner p {
@@ -328,7 +368,7 @@ function startAligning(): void {
 }
 
 .unsynced-banner button {
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 10.5px;
   white-space: nowrap;
 }
@@ -364,9 +404,9 @@ function startAligning(): void {
   position: relative;
   border: 0;
   background: transparent;
-  color: rgb(235 239 228 / 26%);
-  font-family: var(--font-display);
-  font-size: 15px;
+  color: var(--lyrics-dim);
+  font-family: var(--font-lyrics), var(--font-lyrics-han), var(--font-lyrics-ja), var(--font-lyrics-ko), sans-serif;
+  font-size: var(--lyrics-font-size);
   font-weight: 440;
   line-height: 1.7;
   letter-spacing: -0.015em;
@@ -377,22 +417,69 @@ function startAligning(): void {
   cursor: default;
 }
 
+.lyric-main {
+  display: block;
+}
+
+.lyric-annotation {
+  display: block;
+  margin-top: 2px;
+  color: var(--faint);
+  font-family: var(--font-lyrics), var(--font-lyrics-latin), sans-serif;
+  font-size: 0.62em;
+  letter-spacing: 0.02em;
+}
+
+.lyric-translation {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 0.62em;
+  font-weight: 400;
+  line-height: 1.55;
+}
+
+.lyric-line.active .lyric-annotation {
+  color: var(--faint);
+}
+
+.lyric-line.active .lyric-translation {
+  color: var(--muted);
+}
+
+.lyric-line.lang-han {
+  font-family: var(--font-lyrics-han), var(--font-lyrics), sans-serif;
+}
+
+.lyric-line.lang-ja {
+  font-family: var(--font-lyrics-ja), var(--font-lyrics), var(--font-lyrics-han), sans-serif;
+}
+
+.lyric-line.lang-ko {
+  font-family: var(--font-lyrics-ko), var(--font-lyrics), sans-serif;
+}
+
+.lyric-line.lang-latin {
+  font-family: var(--font-lyrics-latin), var(--font-lyrics), sans-serif;
+}
+
 .lyric-line.clickable {
   cursor: pointer;
 }
 
 .lyric-line.clickable:hover {
-  color: rgb(245 247 238 / 65%);
-  background: rgb(255 255 255 / 2%);
+  color: var(--lyrics-hover);
+  background: var(--surface-soft);
 }
 
 .lyric-line.passed {
-  color: rgb(235 239 228 / 16%);
+  color: var(--lyrics-passed);
 }
 
 .lyric-line.active {
   color: var(--text-bright);
-  font-size: 21px;
+  font-size: var(--lyrics-active-font-size);
   font-weight: 540;
   letter-spacing: -0.02em;
   line-height: 1.55;
@@ -408,8 +495,8 @@ function startAligning(): void {
   width: 3px;
   height: 3px;
   border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 9px rgb(200 245 106 / 75%);
+  background: var(--sand);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--sand) 65%, transparent);
 }
 
 .lyrics-inner.is-unsynced {
@@ -417,7 +504,7 @@ function startAligning(): void {
 }
 
 .is-unsynced .lyric-line {
-  color: rgb(235 239 228 / 47%);
+  color: var(--lyrics-unsynced);
 }
 
 .lyrics-tail {
@@ -426,7 +513,7 @@ function startAligning(): void {
   flex-direction: column;
   align-items: center;
   gap: 9px;
-  color: rgb(255 255 255 / 12%);
+  color: var(--lyrics-tail);
   font-family: var(--font-mono);
   font-size: 8px;
   letter-spacing: 0.22em;
@@ -452,7 +539,7 @@ function startAligning(): void {
 }
 
 .empty-quote {
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--font-display);
   font-size: 54px;
   line-height: 0.8;

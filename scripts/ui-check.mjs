@@ -35,6 +35,98 @@ await page.screenshot({ path: 'screenshots/player.png' })
 const title = await page.locator('.track-title').innerText()
 if (!title.includes('第八号夜车')) errors.push(`demo track title missing: ${title}`)
 
+// Phase 1 UI contract: old action buttons are gone, tags are shown, and the
+// player is now using Lucide's pause glyph instead of the custom SVG.
+const removedPlayerAction = await page.locator('.player-tools .align-tool').count()
+if (removedPlayerAction !== 0) errors.push('player bar still shows the align button')
+const removedCoverActions = await page.locator('.track-actions').count()
+if (removedCoverActions !== 0) errors.push('cover area still shows find/align buttons')
+if ((await page.locator('.tag-chip').count()) < 2) errors.push('initial tags are missing')
+
+await page.evaluate(async () => {
+  const { useApp } = await import('/src/stores/app.ts')
+  useApp().state.playing = true
+})
+await page.waitForTimeout(100)
+const pauseIconClass = (await page.locator('.play-button svg').getAttribute('class')) || ''
+if (!pauseIconClass.includes('lucide-pause')) {
+  errors.push(`pause icon is not provided by Lucide: ${pauseIconClass}`)
+}
+await page.evaluate(async () => {
+  const { useApp } = await import('/src/stores/app.ts')
+  useApp().state.playing = false
+})
+await page.waitForTimeout(100)
+
+const volumeValue = page.locator('.volume-value')
+const volumeBeforeMute = await volumeValue.innerText()
+const volumeStep = await page.locator('.volume-range').getAttribute('step')
+if (volumeStep !== '0.1') errors.push(`volume step is ${volumeStep}, expected 0.1`)
+await page.getByRole('button', { name: '静音' }).click()
+await page.waitForTimeout(150)
+if ((await volumeValue.innerText()) !== '0') errors.push('muting did not show volume 0')
+await page.getByRole('button', { name: '恢复音量' }).click()
+await page.waitForTimeout(220)
+if ((await volumeValue.innerText()) !== volumeBeforeMute) {
+  errors.push(`mute restore changed volume: ${volumeBeforeMute} -> ${await volumeValue.innerText()}`)
+}
+
+const tagInput = page.getByRole('textbox', { name: '添加标签' })
+await tagInput.fill('测试')
+await tagInput.press('Enter')
+await page.waitForTimeout(250)
+if (!(await page.locator('.tag-chip', { hasText: '测试' }).count())) {
+  errors.push('adding a tag did not update the tag list')
+}
+
+// File issue state: banner is shown and the play button is disabled.
+await page.evaluate(async () => {
+  const { useApp } = await import('/src/stores/app.ts')
+  const app = useApp()
+  const trackId = app.state.currentTrackId
+  if (trackId) {
+    app.state.trackIssues[trackId] = {
+      trackId,
+      status: 'missing',
+      message: '文件不存在或已被移动，请重新导入或从曲库移除。'
+    }
+  }
+})
+await page.waitForTimeout(200)
+if (!(await page.locator('.track-issue').count())) errors.push('missing-file banner was not shown')
+if (!(await page.locator('.play-button').isDisabled())) errors.push('play button is not disabled for a missing file')
+await page.screenshot({ path: 'screenshots/track-issue.png' })
+await page.evaluate(async () => {
+  const { useApp } = await import('/src/stores/app.ts')
+  const app = useApp()
+  if (app.state.currentTrackId) delete app.state.trackIssues[app.state.currentTrackId]
+})
+await page.waitForTimeout(150)
+
+// Explicit unsupported-file modal. This injects the same store state that the
+// Rust importer produces for fragmented MP4 files.
+await page.evaluate(async () => {
+  const { useApp } = await import('/src/stores/app.ts')
+  const app = useApp()
+  app.state.importIssues = [
+    {
+      path: 'D:\\Media\\Music\\Glass Animals\\《I Love You So Fucking Much》.mp3',
+      reason:
+        '检测到该文件实际是 fragmented MP4（分片 MP4，常见音轨为 AAC），不是普通的 MP3/M4A 文件。当前版本暂不支持分片 MP4，已停止导入和播放以避免闪退。请先将它转换为普通 M4A 或 MP3 后再导入。'
+    }
+  ]
+  app.state.importIssuesOpen = true
+})
+await page.waitForTimeout(300)
+const issueModalTitle = await page.locator('.issues-modal h2').innerText()
+if (!issueModalTitle.includes('此文件暂不支持')) {
+  errors.push(`unsupported import modal title missing: ${issueModalTitle}`)
+}
+await page.screenshot({ path: 'screenshots/import-unsupported.png' })
+await page.getByRole('button', { name: '知道了' }).click()
+await page.waitForTimeout(200)
+if (await page.locator('.issues-modal').count()) errors.push('unsupported import modal did not close')
+
 // Online lyric search with a deterministic mocked response.
 await page.route('https://lrclib.net/**', async (route) => {
   const url = route.request().url()
@@ -73,7 +165,7 @@ await page.route('https://lrclib.net/**', async (route) => {
       }
   await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(payload) })
 })
-await page.getByRole('button', { name: '找歌词' }).click()
+await page.getByRole('button', { name: '找词' }).click()
 await page.waitForTimeout(700)
 await page.screenshot({ path: 'screenshots/find-lyrics.png' })
 const resultCount = await page.locator('.result-row').count()
@@ -90,6 +182,26 @@ await page.screenshot({ path: 'screenshots/align.png' })
 
 const rowCount = await page.locator('.align-row').count()
 if (rowCount < 10) errors.push(`alignment rows missing: ${rowCount}`)
+
+const nativeAlignSliders = await page.locator('.align-console input[type="range"]').count()
+if (nativeAlignSliders !== 0) {
+  errors.push(`alignment console still contains a native range input: ${nativeAlignSliders}`)
+}
+const customScrubberCount = await page.locator('.align-scrubber').count()
+if (customScrubberCount !== 1) {
+  errors.push(`custom alignment scrubber missing: ${customScrubberCount}`)
+}
+const timeBeforeSeek = await page.locator('.big-time > span').innerText()
+const scrubberBox = await page.locator('.align-scrubber').boundingBox()
+if (scrubberBox) {
+  await page.mouse.click(scrubberBox.x + scrubberBox.width * 0.25, scrubberBox.y + scrubberBox.height / 2)
+  await page.waitForTimeout(250)
+}
+const timeAfterSeek = await page.locator('.big-time > span').innerText()
+if (timeBeforeSeek === timeAfterSeek) {
+  errors.push(`custom alignment scrubber did not seek: ${timeBeforeSeek}`)
+}
+await page.screenshot({ path: 'screenshots/align.png' })
 
 // Keyboard adjustment should change the active line's timestamp.
 const activeRow = page.locator('.align-row.current')

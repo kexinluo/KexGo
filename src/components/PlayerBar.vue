@@ -9,19 +9,37 @@ const {
   state,
   currentTrack,
   currentCover,
+  currentLyrics,
+  currentPlaybackIssue,
   progress,
   displayDuration,
   togglePlay,
   step,
   seekTo,
   setVolume,
-  openAlignment,
-  currentLyrics
+  cyclePlayMode,
+  openQueue,
+  beginSpeedHold,
+  endSpeedHold,
+  toggleSpeed
 } = useApp()
+
+const playModeIcon = computed(() => {
+  if (state.playMode === 'shuffle') return 'shuffle'
+  if (state.playMode === 'repeat-one') return 'repeat-one'
+  return 'repeat'
+})
+
+const playModeLabel = computed(() => {
+  if (state.playMode === 'shuffle') return '随机播放'
+  if (state.playMode === 'repeat-one') return '单曲循环'
+  return '顺序循环'
+})
 
 const scrubbing = ref(false)
 const scrubValue = ref(0)
 const volumeLocal = ref(state.volume)
+let lastAudibleVolume = state.volume > 0 ? state.volume : 0.7
 let volumeCommitTimer: number | null = null
 
 watch(
@@ -36,6 +54,7 @@ watch(
   () => state.volume,
   (volume) => {
     volumeLocal.value = volume
+    if (volume > 0.001) lastAudibleVolume = volume
   }
 )
 
@@ -44,7 +63,7 @@ const rangePercent = computed(() => {
   if (!displayDuration.value) return 0
   return clamp((displayedPosition.value / displayDuration.value) * 100, 0, 100)
 })
-const volumePercent = computed(() => volumeLocal.value * 100)
+const volumePercent = computed(() => Math.round(volumeLocal.value * 100))
 const volumeIcon = computed(() => {
   if (volumeLocal.value <= 0.001) return 'volume-mute'
   if (volumeLocal.value < 0.4) return 'volume-low'
@@ -69,9 +88,14 @@ function commitScrub(): void {
   void seekTo(target)
 }
 
+function snapVolume(value: number): number {
+  return clamp(Math.round(value * 10) / 10, 0, 1)
+}
+
 function onVolumeInput(event: Event): void {
-  const value = Number((event.target as HTMLInputElement).value)
+  const value = snapVolume(Number((event.target as HTMLInputElement).value))
   volumeLocal.value = value
+  if (value > 0.001) lastAudibleVolume = value
   if (volumeCommitTimer !== null) window.clearTimeout(volumeCommitTimer)
   volumeCommitTimer = window.setTimeout(() => {
     void setVolume(value)
@@ -80,18 +104,14 @@ function onVolumeInput(event: Event): void {
 
 function toggleMute(): void {
   if (volumeLocal.value > 0) {
+    lastAudibleVolume = volumeLocal.value
     volumeLocal.value = 0
     void setVolume(0)
   } else {
-    volumeLocal.value = 0.7
-    void setVolume(0.7)
+    const restored = lastAudibleVolume > 0 ? lastAudibleVolume : 0.7
+    volumeLocal.value = restored
+    void setVolume(restored, 180)
   }
-}
-
-function openAlign(): void {
-  openAlignment(
-    currentLyrics.value.hasTimestamps ? undefined : currentTrack.value?.lyricsText || undefined
-  )
 }
 
 onBeforeUnmount(() => {
@@ -123,7 +143,7 @@ onBeforeUnmount(() => {
         <button
           class="transport-button"
           aria-label="上一首"
-          :disabled="!state.tracks.length"
+          :disabled="!state.queue.length"
           @click="step(-1)"
         >
           <AppIcon name="previous" :size="17" />
@@ -131,8 +151,9 @@ onBeforeUnmount(() => {
         <button
           class="play-button"
           :class="{ loading: state.audioLoading }"
-          :aria-label="state.playing ? '暂停' : '播放'"
-          :disabled="!currentTrack"
+          :aria-label="currentPlaybackIssue ? `无法播放：${currentPlaybackIssue.message}` : state.playing ? '暂停' : '播放'"
+          :title="currentPlaybackIssue?.message || (state.playing ? '暂停' : '播放')"
+          :disabled="!currentTrack || Boolean(currentPlaybackIssue)"
           @click="togglePlay"
         >
           <span v-if="state.audioLoading" class="play-spinner"></span>
@@ -141,7 +162,7 @@ onBeforeUnmount(() => {
         <button
           class="transport-button"
           aria-label="下一首"
-          :disabled="!state.tracks.length"
+          :disabled="!state.queue.length"
           @click="step(1)"
         >
           <AppIcon name="next" :size="17" />
@@ -173,13 +194,33 @@ onBeforeUnmount(() => {
 
     <div class="player-tools">
       <button
-        class="align-tool"
-        :disabled="!currentTrack"
-        title="快速对轴"
-        @click="openAlign"
+        class="speed-badge"
+        :class="{ active: state.playbackRate !== 1 }"
+        :aria-label="`播放倍速 ${state.playbackRate.toFixed(2)} 倍`"
+        title="按住临时加速，双击切换 1× / 1.5×"
+        @pointerdown.prevent="beginSpeedHold"
+        @pointerup="endSpeedHold"
+        @pointerleave="endSpeedHold"
+        @dblclick.stop="toggleSpeed"
       >
-        <AppIcon name="align" :size="15" />
-        <span>对轴</span>
+        {{ state.playbackRate.toFixed(2).replace(/\.?0+$/, '') }}×
+      </button>
+      <button
+        class="tool-button"
+        :aria-label="playModeLabel"
+        :title="playModeLabel"
+        @click="cyclePlayMode"
+      >
+        <AppIcon :name="playModeIcon" :size="16" />
+      </button>
+      <button
+        class="tool-button queue-button"
+        :aria-label="`播放队列，${state.queue.length} 首`"
+        :title="`播放队列 · ${state.queue.length} 首`"
+        @click="openQueue"
+      >
+        <AppIcon name="queue" :size="16" />
+        <span class="queue-count">{{ state.queue.length }}</span>
       </button>
       <div class="volume-control">
         <button class="volume-icon" :aria-label="volumeLocal > 0 ? '静音' : '恢复音量'" @click="toggleMute">
@@ -190,12 +231,14 @@ onBeforeUnmount(() => {
           type="range"
           min="0"
           max="1"
-          step="0.01"
+          step="0.1"
           :value="volumeLocal"
           aria-label="音量"
+          :aria-valuetext="`${volumePercent}%`"
           :style="{ '--range-progress': `${volumePercent}%` }"
           @input="onVolumeInput"
         />
+        <span class="volume-value">{{ volumePercent }}</span>
       </div>
     </div>
   </footer>
@@ -207,12 +250,12 @@ onBeforeUnmount(() => {
   z-index: 20;
   flex: 0 0 90px;
   display: grid;
-  grid-template-columns: minmax(220px, 0.8fr) minmax(360px, 1.4fr) minmax(190px, 0.8fr);
+  grid-template-columns: minmax(220px, 0.8fr) minmax(360px, 1.4fr) minmax(288px, 0.9fr);
   align-items: center;
   gap: 24px;
   padding: 0 28px;
   border-top: 1px solid var(--line);
-  background: rgb(17 19 16 / 88%);
+  background: var(--player-bg);
   backdrop-filter: blur(22px);
 }
 
@@ -260,7 +303,7 @@ onBeforeUnmount(() => {
 }
 
 .mini-lyric-state.synced {
-  color: rgb(200 245 106 / 72%);
+  color: var(--accent-text);
   border-color: rgb(200 245 106 / 16%);
 }
 
@@ -309,7 +352,7 @@ onBeforeUnmount(() => {
   width: 39px;
   height: 39px;
   border-radius: 50%;
-  color: #11140e;
+  color: var(--on-accent);
   background: var(--accent);
   box-shadow: 0 0 0 1px rgb(255 255 255 / 12%) inset, 0 6px 18px rgb(200 245 106 / 12%);
   transition: transform 160ms ease, background 160ms ease;
@@ -317,11 +360,11 @@ onBeforeUnmount(() => {
 
 .play-button:hover:not(:disabled) {
   transform: scale(1.05);
-  background: #d4ff77;
+  background: var(--accent-strong);
 }
 
 .play-button.loading {
-  color: var(--accent);
+  color: var(--accent-text);
   background: transparent;
   border: 1px solid rgb(200 245 106 / 26%);
 }
@@ -335,7 +378,7 @@ onBeforeUnmount(() => {
   height: 15px;
   border-radius: 50%;
   border: 1.5px solid rgb(200 245 106 / 22%);
-  border-top-color: var(--accent);
+  border-top-color: var(--accent-text);
   animation: spin 700ms linear infinite;
 }
 
@@ -436,40 +479,69 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 17px;
+  gap: 13px;
   min-width: 0;
 }
 
-.align-tool {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 9px;
-  border-radius: 7px;
-  color: var(--muted);
-  font-size: 10px;
+.speed-badge {
+  min-width: 30px;
+  height: 22px;
+  padding: 0 5px;
+  color: var(--faint);
   border: 1px solid var(--line);
-  transition: all 160ms ease;
-  flex: 0 0 auto;
+  border-radius: 5px;
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  letter-spacing: -0.02em;
 }
 
-.align-tool:hover:not(:disabled) {
-  color: var(--accent);
-  border-color: rgb(200 245 106 / 20%);
-  background: rgb(200 245 106 / 4%);
+.speed-badge:hover,
+.speed-badge.active {
+  color: var(--accent-text);
+  border-color: rgb(200 245 106 / 24%);
+  background: var(--accent-soft);
 }
 
-.align-tool:disabled {
-  opacity: 0.35;
-  cursor: default;
+.tool-button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  color: var(--muted);
+  border-radius: 50%;
+  border: 1px solid transparent;
+  transition: color 160ms ease, border-color 160ms ease;
+}
+
+.tool-button:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.queue-button .queue-count {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0 3px;
+  display: grid;
+  place-items: center;
+  color: var(--accent-text);
+  background: var(--badge-bg);
+  border: 1px solid rgb(200 245 106 / 22%);
+  border-radius: 7px;
+  font-family: var(--font-mono);
+  font-size: 6.5px;
+  line-height: 1;
 }
 
 .volume-control {
   display: flex;
   align-items: center;
   gap: 7px;
-  width: 122px;
+  width: 155px;
 }
 
 .volume-icon {
@@ -500,17 +572,27 @@ onBeforeUnmount(() => {
   margin-top: -2.5px;
 }
 
+.volume-value {
+  width: 23px;
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 1180px) {
   .player-bar {
-    grid-template-columns: minmax(170px, 0.65fr) minmax(300px, 1.45fr) minmax(155px, 0.65fr);
+    grid-template-columns: minmax(170px, 0.65fr) minmax(280px, 1.45fr) minmax(242px, 0.75fr);
     gap: 14px;
     padding: 0 20px;
   }
   .player-tools {
-    gap: 10px;
+    gap: 7px;
   }
   .volume-control {
-    width: 95px;
+    width: 104px;
   }
   .mini-lyric-state {
     display: none;

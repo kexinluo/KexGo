@@ -53,7 +53,7 @@ const icons: Record<string, string> = {
   gap: 11px;
   padding: 13px 12px 13px 13px;
   color: var(--text);
-  background: rgb(27 30 26 / 96%);
+  background: var(--toast-bg);
   border: 1px solid var(--line-strong);
   box-shadow: 0 18px 50px rgb(0 0 0 / 45%);
   border-radius: 13px;
@@ -68,11 +68,11 @@ const icons: Record<string, string> = {
   flex: 0 0 auto;
   border-radius: 8px;
   background: var(--accent-soft);
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .toast-success .toast-icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .toast-error .toast-icon {
   color: #ff9378;

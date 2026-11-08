@@ -2,14 +2,19 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from './api'
 import { useApp } from './stores/app'
+import { shortcutMatches } from './utils/shortcuts'
 import AlignView from './components/AlignView.vue'
 import AppIcon from './components/AppIcon.vue'
 import EmptyState from './components/EmptyState.vue'
+import ImportIssuesModal from './components/ImportIssuesModal.vue'
 import LibrarySidebar from './components/LibrarySidebar.vue'
 import LyricsPane from './components/LyricsPane.vue'
+import LyricsNotesModal from './components/LyricsNotesModal.vue'
 import LyricsSearchModal from './components/LyricsSearchModal.vue'
 import NowPlaying from './components/NowPlaying.vue'
 import PlayerBar from './components/PlayerBar.vue'
+import QueueDrawer from './components/QueueDrawer.vue'
+import SettingsModal from './components/SettingsModal.vue'
 import ToastStack from './components/ToastStack.vue'
 import TrackEditModal from './components/TrackEditModal.vue'
 
@@ -23,13 +28,25 @@ const {
   closeLyricsModal,
   closeEditModal,
   loadCover,
-  toast
+  toast,
+  openSettings,
+  togglePlay,
+  step,
+  adjustVolume,
+  seekBy,
+  toggleSpeed,
+  beginSpeedHold,
+  endSpeedHold,
+  nudgeSpeed
 } = useApp()
 
 const sidebarRef = ref<InstanceType<typeof LibrarySidebar> | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const dropDepth = ref(0)
 let dropUnlisten: (() => void) | null = null
+let closeUnlisten: (() => void) | null = null
+let trayUnlisten: (() => void) | null = null
+let minimizeUnlisten: (() => void) | null = null
 
 const isOverlayOpen = computed(() => state.activeView === 'align')
 const importLabel = computed(() => (state.importBusy ? '正在导入…' : '导入歌曲'))
@@ -87,11 +104,95 @@ function onGlobalKeydown(event: KeyboardEvent): void {
     target instanceof HTMLTextAreaElement ||
     target instanceof HTMLSelectElement ||
     target?.isContentEditable
-  if (isEditable || state.activeView === 'align' || state.lyricsModalOpen || state.editModalOpen) return
+  if (
+    isEditable ||
+    state.activeView === 'align' ||
+    state.lyricsModalOpen ||
+    state.editModalOpen ||
+    state.importIssuesOpen ||
+    state.queueOpen ||
+    state.settingsOpen ||
+    state.lyricsNotesOpen
+  ) {
+    return
+  }
+  const shortcuts = state.preferences.shortcuts
+
+  if (shortcutMatches(event, shortcuts.playPause)) {
+    event.preventDefault()
+    if (!event.repeat) void togglePlay()
+    return
+  }
+  if (event.repeat) return
+  if (shortcutMatches(event, shortcuts.previous)) {
+    event.preventDefault()
+    void step(-1)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.next)) {
+    event.preventDefault()
+    void step(1)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.volumeUp)) {
+    event.preventDefault()
+    adjustVolume(0.05)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.volumeDown)) {
+    event.preventDefault()
+    adjustVolume(-0.05)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.seekBack5)) {
+    event.preventDefault()
+    seekBy(-5)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.seekForward5)) {
+    event.preventDefault()
+    seekBy(5)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.seekBack10)) {
+    event.preventDefault()
+    seekBy(-10)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.seekForward10)) {
+    event.preventDefault()
+    seekBy(10)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.speedHold)) {
+    event.preventDefault()
+    beginSpeedHold()
+    return
+  }
+  if (shortcutMatches(event, shortcuts.speedToggle)) {
+    event.preventDefault()
+    toggleSpeed()
+    return
+  }
+  if (shortcutMatches(event, shortcuts.speedUp)) {
+    event.preventDefault()
+    nudgeSpeed(0.25)
+    return
+  }
+  if (shortcutMatches(event, shortcuts.speedDown)) {
+    event.preventDefault()
+    nudgeSpeed(-0.25)
+    return
+  }
+
   if (event.key === '/') {
     event.preventDefault()
     sidebarRef.value?.focusSearch()
   }
+}
+
+function onGlobalKeyup(event: KeyboardEvent): void {
+  if (shortcutMatches(event, state.preferences.shortcuts.speedHold)) endSpeedHold()
 }
 
 function onNativeDrop(paths: string[]): void {
@@ -101,8 +202,16 @@ function onNativeDrop(paths: string[]): void {
 onMounted(async () => {
   await init()
   window.addEventListener('keydown', onGlobalKeydown)
+  window.addEventListener('keyup', onGlobalKeyup)
   if (api.isTauri) {
     dropUnlisten = await api.onFileDrop(onNativeDrop)
+    closeUnlisten = await api.onCloseRequested(() => state.closeToTray)
+    minimizeUnlisten = await api.onMinimized(() => state.closeToTray)
+    trayUnlisten = await api.onTrayAction((action) => {
+      if (action === 'play-pause') void togglePlay()
+      if (action === 'previous') void step(-1)
+      if (action === 'next') void step(1)
+    })
   }
   if (currentTrack.value) {
     void loadCover(currentTrack.value)
@@ -119,7 +228,11 @@ watch(
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onGlobalKeydown)
+  window.removeEventListener('keyup', onGlobalKeyup)
   dropUnlisten?.()
+  closeUnlisten?.()
+  minimizeUnlisten?.()
+  trayUnlisten?.()
 })
 </script>
 
@@ -134,10 +247,7 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="brand-lockup">
         <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 28 28" fill="none">
-            <path d="M8.2 5.5v17" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" />
-            <path d="m20.3 5.7-7.1 8.2 7.5 8.6" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
+          <span class="brand-letter">K</span>
         </span>
         <div class="brand-words">
           <span class="brand-name">KexGo</span>
@@ -153,6 +263,9 @@ onBeforeUnmount(() => {
 
       <div class="topbar-actions">
         <span v-if="!api.isTauri" class="preview-badge">浏览器预览</span>
+        <button class="settings-button" aria-label="设置" title="设置" @click="openSettings">
+          <AppIcon name="settings" :size="16" />
+        </button>
         <button class="import-button" :disabled="state.importBusy" @click="handleImport">
           <span v-if="state.importBusy" class="top-spinner"></span>
           <AppIcon v-else name="plus" :size="15" :stroke-width="2" />
@@ -163,12 +276,20 @@ onBeforeUnmount(() => {
     </header>
 
     <div class="app-body">
-      <LibrarySidebar ref="sidebarRef" @import="handleImport" />
+      <LibrarySidebar
+        v-if="state.preferences.layout.showSidebar"
+        ref="sidebarRef"
+        @import="handleImport"
+      />
 
       <main class="main-area">
-        <div v-if="currentTrack" class="player-layout">
+        <div
+          v-if="currentTrack"
+          class="player-layout"
+          :class="{ solo: !state.preferences.layout.showLyrics }"
+        >
           <NowPlaying />
-          <LyricsPane />
+          <LyricsPane v-if="state.preferences.layout.showLyrics" />
         </div>
         <EmptyState v-else @import="handleImport" />
       </main>
@@ -208,7 +329,11 @@ onBeforeUnmount(() => {
     </Transition>
 
     <LyricsSearchModal v-if="state.lyricsModalOpen" @close="closeLyricsModal" />
+    <LyricsNotesModal v-if="state.lyricsNotesOpen" />
     <TrackEditModal v-if="state.editModalOpen" @close="closeEditModal" />
+    <ImportIssuesModal v-if="state.importIssuesOpen" />
+    <QueueDrawer v-if="state.queueOpen" />
+    <SettingsModal v-if="state.settingsOpen" />
     <AlignView v-if="isOverlayOpen && currentTrack" />
     <ToastStack />
   </div>
@@ -225,7 +350,7 @@ onBeforeUnmount(() => {
   background:
     radial-gradient(ellipse at 74% -4%, rgb(200 245 106 / 5.5%), transparent 36%),
     radial-gradient(ellipse at 12% 105%, rgb(238 200 130 / 2.5%), transparent 32%),
-    #0c0e0c;
+    var(--app-bg);
 }
 
 .app-shell::after {
@@ -248,7 +373,7 @@ onBeforeUnmount(() => {
   gap: 28px;
   padding: 0 27px;
   border-bottom: 1px solid var(--line);
-  background: rgb(13 15 12 / 58%);
+  background: var(--topbar-bg);
   backdrop-filter: blur(18px);
 }
 
@@ -265,14 +390,18 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   border-radius: 8px;
-  color: #10130d;
+  color: var(--on-accent);
   background: var(--accent);
   box-shadow: 0 4px 20px rgb(200 245 106 / 12%);
 }
 
-.brand-mark svg {
-  width: 21px;
-  height: 21px;
+.brand-letter {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.08em;
+  line-height: 1;
+  transform: translateX(-1px);
 }
 
 .brand-words {
@@ -354,6 +483,23 @@ onBeforeUnmount(() => {
   letter-spacing: 0.03em;
 }
 
+.settings-button {
+  display: grid;
+  place-items: center;
+  width: 31px;
+  height: 31px;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  transition: color 160ms ease, border-color 160ms ease, background 160ms ease;
+}
+
+.settings-button:hover {
+  color: var(--text);
+  border-color: var(--line);
+  background: var(--surface-soft);
+}
+
 .import-button {
   display: inline-flex;
   align-items: center;
@@ -363,15 +509,15 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   color: var(--text);
   border: 1px solid var(--line-strong);
-  background: rgb(255 255 255 / 3%);
+  background: var(--surface-soft);
   font-size: 10.5px;
   transition: all 160ms ease;
   white-space: nowrap;
 }
 
 .import-button:hover:not(:disabled) {
-  background: rgb(255 255 255 / 5.5%);
-  border-color: rgb(255 255 255 / 16%);
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
 }
 
 .import-button:disabled {
@@ -393,8 +539,8 @@ onBeforeUnmount(() => {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  border: 1.5px solid rgb(255 255 255 / 14%);
-  border-top-color: var(--accent);
+  border: 1.5px solid var(--line-strong);
+  border-top-color: var(--accent-text);
   animation: spin 700ms linear infinite;
 }
 
@@ -430,6 +576,11 @@ onBeforeUnmount(() => {
   padding: clamp(24px, 3vw, 38px) clamp(28px, 3.6vw, 52px) 26px;
 }
 
+.player-layout.solo {
+  grid-template-columns: minmax(280px, 520px);
+  justify-content: start;
+}
+
 .player-layout > :first-child {
   padding-right: 4px;
 }
@@ -449,7 +600,7 @@ onBeforeUnmount(() => {
   z-index: 90;
   display: grid;
   place-items: center;
-  background: rgb(5 7 5 / 72%);
+  background: var(--overlay-bg);
   backdrop-filter: blur(12px);
 }
 
@@ -458,7 +609,7 @@ onBeforeUnmount(() => {
   padding: 44px 34px 37px;
   border-radius: 20px;
   border: 1px dashed rgb(200 245 106 / 33%);
-  background: rgb(20 23 18 / 92%);
+  background: var(--drop-card-bg);
   text-align: center;
   box-shadow: 0 30px 100px rgb(0 0 0 / 50%);
 }
@@ -470,7 +621,7 @@ onBeforeUnmount(() => {
   height: 60px;
   margin: 0 auto 20px;
   border-radius: 17px;
-  color: var(--accent);
+  color: var(--accent-text);
   background: rgb(200 245 106 / 7%);
   border: 1px solid rgb(200 245 106 / 15%);
 }
@@ -517,7 +668,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   gap: 22px;
-  background: #0b0d0b;
+  background: var(--app-bg);
 }
 
 .boot-brand {
@@ -537,7 +688,7 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   border-radius: 8px;
-  color: #10130d;
+  color: var(--on-accent);
   background: var(--accent);
   font-family: var(--font-display);
   font-size: 17px;

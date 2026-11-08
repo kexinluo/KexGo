@@ -11,9 +11,42 @@
   --accent: #c8f56a;
   --accent-strong: #d8ff86;
   --accent-soft: rgb(200 245 106 / 8%);
+  --accent-text: var(--accent);
+  --on-accent: #11140e;
   --sand: #e9c986;
+  --font-lyrics: var(--font-display);
+  --font-lyrics-han: 'PingFang SC', 'Microsoft YaHei UI', 'Noto Sans CJK SC', sans-serif;
+  --font-lyrics-latin: 'Segoe UI Variable Text', 'Segoe UI', 'SF Pro Text', sans-serif;
+  --font-lyrics-ja: 'Yu Gothic UI', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+  --font-lyrics-ko: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
+  --sidebar-width: 310px;
+  --cover-scale: 1;
   --line: rgb(255 255 255 / 7%);
   --line-strong: rgb(255 255 255 / 12%);
+  --surface-soft: rgb(255 255 255 / 3%);
+  --surface-hover: rgb(255 255 255 / 6%);
+  --app-bg: #0c0e0c;
+  --topbar-bg: rgb(13 15 12 / 58%);
+  --sidebar-bg: rgb(15 17 15 / 62%);
+  --player-bg: rgb(17 19 16 / 88%);
+  --panel-bg: #141713;
+  --drawer-bg: #121510;
+  --drawer-footer-bg: rgb(9 11 8 / 38%);
+  --overlay-bg: rgb(4 5 4 / 72%);
+  --drawer-scrim: rgb(4 6 4 / 48%);
+  --toast-bg: rgb(27 30 26 / 96%);
+  --suggestion-bg: #1a1d16;
+  --badge-bg: #171b12;
+  --drop-card-bg: rgb(20 23 18 / 92%);
+  --scrollbar-thumb: rgb(255 255 255 / 8%);
+  --scrollbar-thumb-hover: rgb(255 255 255 / 14%);
+  --lyrics-dim: rgb(235 239 228 / 26%);
+  --lyrics-hover: rgb(245 247 238 / 65%);
+  --lyrics-passed: rgb(235 239 228 / 16%);
+  --lyrics-unsynced: rgb(235 239 228 / 47%);
+  --lyrics-tail: rgb(255 255 255 / 12%);
+  --lyrics-font-size: 15px;
+  --lyrics-active-font-size: 21px;
   --font-sans: 'Segoe UI Variable Text', 'Segoe UI', 'SF Pro Text', 'PingFang SC', 'Microsoft YaHei UI',
     'Microsoft YaHei', sans-serif;
   --font-display: 'Segoe UI Variable Display', 'Segoe UI', 'SF Pro Display', 'PingFang SC',
@@ -23,6 +56,47 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f4f1e8;
+  --bg-raised: #ebe7dc;
+  --surface: #fffdf6;
+  --surface-bright: #ffffff;
+  --text-bright: #1b2118;
+  --text: #2b3328;
+  --muted: #687262;
+  --faint: #939d8c;
+  --accent: #a8dc48;
+  --accent-strong: #b9e85c;
+  --accent-soft: rgb(107 151 39 / 10%);
+  --accent-text: #4d7318;
+  --sand: #94671f;
+  --line: rgb(35 45 28 / 10%);
+  --line-strong: rgb(35 45 28 / 17%);
+  --surface-soft: rgb(35 45 28 / 4%);
+  --surface-hover: rgb(35 45 28 / 7%);
+  --app-bg: #f4f1e8;
+  --topbar-bg: rgb(250 248 241 / 78%);
+  --sidebar-bg: rgb(244 241 232 / 82%);
+  --player-bg: rgb(252 250 243 / 90%);
+  --panel-bg: #fffdf6;
+  --drawer-bg: #fffdf6;
+  --drawer-footer-bg: rgb(240 237 228 / 66%);
+  --overlay-bg: rgb(35 38 30 / 32%);
+  --drawer-scrim: rgb(35 38 30 / 25%);
+  --toast-bg: rgb(255 253 246 / 96%);
+  --suggestion-bg: #fffdf6;
+  --badge-bg: #f1efe4;
+  --drop-card-bg: #fffdf6;
+  --scrollbar-thumb: rgb(35 45 28 / 14%);
+  --scrollbar-thumb-hover: rgb(35 45 28 / 22%);
+  --lyrics-dim: rgb(43 51 40 / 36%);
+  --lyrics-hover: rgb(43 51 40 / 78%);
+  --lyrics-passed: rgb(43 51 40 / 24%);
+  --lyrics-unsynced: rgb(43 51 40 / 60%);
+  --lyrics-tail: rgb(43 51 40 / 34%);
 }
 
 * {
@@ -47,6 +121,7 @@ body {
   font-size: 12px;
   overflow: hidden;
   user-select: none;
+  transition: background-color 180ms ease, color 180ms ease;
 }
 
 body.modal-open,
@@ -104,14 +179,14 @@ img {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgb(255 255 255 / 8%);
+  background: var(--scrollbar-thumb);
   border: 2px solid transparent;
   background-clip: padding-box;
   border-radius: 8px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgb(255 255 255 / 14%);
+  background: var(--scrollbar-thumb-hover);
   border: 2px solid transparent;
   background-clip: padding-box;
 }
@@ -125,7 +200,7 @@ img {
   height: 35px;
   padding: 0 13px;
   border-radius: 8px;
-  color: #11140e;
+  color: var(--on-accent);
   background: var(--accent);
   font-size: 11px;
   font-weight: 560;
@@ -186,6 +261,47 @@ img {
   font-size: 8px;
   font-weight: 600;
   letter-spacing: 0.16em;
+}
+
+/* Shared range reset. Component styles provide the track colors, while this
+   base rule prevents the native WebView slider skin from leaking through. */
+input[type='range'].range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type='range'].range:disabled {
+  cursor: default;
+}
+
+input[type='range'].range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 9px;
+  height: 9px;
+  margin-top: -3.5px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px rgb(200 245 106 / 10%);
+}
+
+input[type='range'].range::-moz-range-thumb {
+  width: 9px;
+  height: 9px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+input[type='range'].range:focus-visible {
+  outline: none;
 }
 
 kbd {

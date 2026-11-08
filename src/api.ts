@@ -1,14 +1,20 @@
 import { DEMO_TRACK_ID, createDemoTrack } from './demo'
+import { createDefaultPreferences } from './utils/preferences'
 import type {
   AlignmentDraft,
   AppSettings,
+  DataLocation,
   ImportSummary,
   LibrarySnapshot,
+  LyricsNotesFile,
+  MigrationResult,
   LyricsQuery,
   OnlineLyricsResult,
   PlayerTick,
   SaveLyricsResult,
-  Track
+  Track,
+  TrackCheck,
+  TrackIssue
 } from './types'
 
 const isTauri = typeof window !== 'undefined' && Boolean(window.__TAURI_INTERNALS__)
@@ -30,7 +36,16 @@ const BROWSER_SETTINGS: AppSettings = {
   lastTrackId: null,
   lastPosition: 0,
   volume: 0.78,
-  compensationMs: -150
+  compensationMs: -150,
+  queue: null,
+  playMode: 'sequential',
+  sortMode: 'custom',
+  libraryOrder: [],
+  theme: 'dark',
+  closeToTray: true,
+  lyricsFontSize: 15,
+  visualizerEnabled: false,
+  preferences: createDefaultPreferences()
 }
 
 let browserTracks: Track[] = []
@@ -41,6 +56,9 @@ let browserTickHandler: ((tick: PlayerTick) => void) | null = null
 let browserEnded = false
 const browserDrafts = new Map<string, AlignmentDraft>()
 const browserTrackFiles = new Map<string, File>()
+let browserCustomCss = ''
+let browserCustomCssGood = ''
+const browserNotes = new Map<string, LyricsNotesFile>()
 
 function uid(): string {
   return `b-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -171,6 +189,9 @@ async function importBrowserFiles(files: File[]): Promise<ImportSummary> {
       lrcPath: matchingLrc ? 'browser-sidecar' : null,
       lyricsText,
       lyricsOrigin: matchingLrc ? 'sidecar' : 'unknown',
+      tags: [],
+      playCount: 0,
+      pauseFade: false,
       createdAt: Date.now(),
       updatedAt: Date.now()
     }
@@ -225,6 +246,16 @@ export const api = {
     return browserSnapshot()
   },
 
+  async validateLibraryPaths(): Promise<TrackIssue[]> {
+    if (isTauri) return invoke<TrackIssue[]>('validate_library_paths')
+    return []
+  },
+
+  async preflightTrack(trackId: string): Promise<TrackCheck> {
+    if (isTauri) return invoke<TrackCheck>('preflight_track', { trackId })
+    return { status: 'ok', message: '' }
+  },
+
   async chooseAndImportAudio(): Promise<ImportSummary | null> {
     if (!isTauri) return null
     return invoke<ImportSummary | null>('pick_and_import_audio')
@@ -245,6 +276,142 @@ export const api = {
     if (!track) throw new Error('歌曲不存在')
     Object.assign(track, patch, { updatedAt: Date.now() })
     return { ...track }
+  },
+
+  async setTrackTags(trackId: string, tags: string[]): Promise<Track> {
+    if (isTauri) return invoke<Track>('set_track_tags', { trackId, tags })
+    const track = browserTracks.find((item) => item.id === trackId)
+    if (!track) throw new Error('歌曲不存在')
+    track.tags = [...tags]
+    track.updatedAt = Date.now()
+    return { ...track }
+  },
+
+  async setTrackPauseFade(trackId: string, enabled: boolean): Promise<Track> {
+    if (isTauri) return invoke<Track>('set_track_pause_fade', { trackId, enabled })
+    const track = browserTracks.find((item) => item.id === trackId)
+    if (!track) throw new Error('歌曲不存在')
+    track.pauseFade = enabled
+    track.updatedAt = Date.now()
+    return { ...track }
+  },
+
+  async getDataLocation(): Promise<DataLocation> {
+    if (isTauri) return invoke<DataLocation>('get_data_location')
+    return {
+      current: '浏览器预览（不持久化）',
+      default: '浏览器预览（不持久化）',
+      customCssPath: 'custom.css'
+    }
+  },
+
+  async pickDataDirectory(): Promise<string | null> {
+    if (isTauri) return invoke<string | null>('pick_data_directory')
+    return null
+  },
+
+  async migrateDataDirectory(target: string): Promise<MigrationResult> {
+    if (isTauri) return invoke<MigrationResult>('migrate_data_directory', { target })
+    throw new Error('浏览器预览不支持迁移数据目录')
+  },
+
+  async readCustomCss(): Promise<string> {
+    if (isTauri) return invoke<string>('read_custom_css')
+    return browserCustomCss
+  },
+
+  async saveCustomCss(content: string): Promise<void> {
+    if (isTauri) {
+      await invoke('save_custom_css', { content })
+      return
+    }
+    browserCustomCss = content
+    browserCustomCssGood = content
+  },
+
+  async readLastGoodCss(): Promise<string> {
+    if (isTauri) return invoke<string>('read_last_good_css')
+    return browserCustomCssGood
+  },
+
+  async restoreCustomCss(): Promise<void> {
+    if (isTauri) {
+      await invoke('restore_custom_css')
+      return
+    }
+    browserCustomCss = browserCustomCssGood
+  },
+
+  async readLyricsNotes(trackId: string): Promise<LyricsNotesFile | null> {
+    if (isTauri) {
+      const raw = await invoke<string | null>('read_lyrics_notes', { trackId })
+      if (!raw) return null
+      return JSON.parse(raw) as LyricsNotesFile
+    }
+    return browserNotes.get(trackId) ?? null
+  },
+
+  async saveLyricsNotes(trackId: string, notes: LyricsNotesFile): Promise<void> {
+    if (isTauri) {
+      await invoke('save_lyrics_notes', { trackId, content: JSON.stringify(notes) })
+      return
+    }
+    browserNotes.set(trackId, structuredClone(notes))
+  },
+
+  async setSpeed(speed: number): Promise<void> {
+    if (isTauri) {
+      await invoke('set_speed', { speed })
+      return
+    }
+    if (browserAudio) browserAudio.playbackRate = speed
+  },
+
+  async incrementPlayCount(trackId: string): Promise<Track> {
+    if (isTauri) return invoke<Track>('increment_play_count', { trackId })
+    const track = browserTracks.find((item) => item.id === trackId)
+    if (!track) throw new Error('歌曲不存在')
+    track.playCount = (track.playCount ?? 0) + 1
+    track.updatedAt = Date.now()
+    return { ...track }
+  },
+
+  async savePlaylistJson(content: string, suggestedName: string): Promise<string | null> {
+    if (isTauri) {
+      return invoke<string | null>('save_playlist_json', { content, suggestedName })
+    }
+    const name = /\.json$/i.test(suggestedName) ? suggestedName : `${suggestedName}.json`
+    const blob = new Blob([content], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = name
+    anchor.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1500)
+    return name
+  },
+
+  async pickPlaylistJson(): Promise<string | null> {
+    if (isTauri) return invoke<string | null>('pick_playlist_json')
+    return new Promise((resolve) => {
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.accept = '.json,application/json'
+      input.addEventListener('cancel', () => resolve(null), { once: true })
+      input.onchange = async () => {
+        const file = input.files?.[0]
+        if (!file) {
+          resolve(null)
+          return
+        }
+        try {
+          resolve(await file.text())
+        } catch {
+          resolve(null)
+        }
+      }
+      input.click()
+    })
   },
 
   async removeTrack(trackId: string): Promise<void> {
@@ -393,17 +560,17 @@ export const api = {
     }
   },
 
-  async pause(): Promise<void> {
+  async pause(fadeMs = 0): Promise<void> {
     if (isTauri) {
-      await invoke('pause_audio')
+      await invoke('pause_audio', { fadeMs })
       return
     }
     browserAudio?.pause()
   },
 
-  async resume(): Promise<void> {
+  async resume(fadeMs = 0): Promise<void> {
     if (isTauri) {
-      await invoke('resume_audio')
+      await invoke('resume_audio', { fadeMs })
       return
     }
     await browserAudio?.play()
@@ -417,13 +584,16 @@ export const api = {
     if (browserAudio) browserAudio.currentTime = Math.max(0, seconds)
   },
 
-  async setVolume(volume: number): Promise<void> {
+  async setVolume(volume: number, fadeMs = 0): Promise<void> {
     if (isTauri) {
-      await invoke('set_volume', { volume })
+      await invoke('set_volume', { volume, fadeMs })
       return
     }
-    if (browserAudio) browserAudio.volume = Math.max(0, Math.min(1, volume))
-    browserSettings.volume = volume
+    const target = Math.max(0, Math.min(1, volume))
+    if (browserAudio) {
+      browserAudio.volume = target
+    }
+    browserSettings.volume = target
   },
 
   async stop(): Promise<void> {
@@ -453,5 +623,40 @@ export const api = {
     return getCurrentWebview().onDragDropEvent((event) => {
       if (event.payload.type === 'drop') handler(event.payload.paths)
     })
+  },
+
+  async onCloseRequested(shouldHide: () => boolean): Promise<UnlistenFn> {
+    if (!isTauri) return () => undefined
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    return getCurrentWindow().onCloseRequested(async (event) => {
+      if (!shouldHide()) return
+      event.preventDefault()
+      await getCurrentWindow().hide()
+    })
+  },
+
+  async onTrayAction(handler: (action: string) => void): Promise<UnlistenFn> {
+    if (!isTauri) return () => undefined
+    const { listen } = await import('@tauri-apps/api/event')
+    return listen<string>('tray:action', (event) => handler(event.payload))
+  },
+
+  async onMinimized(shouldHide: () => boolean): Promise<UnlistenFn> {
+    if (!isTauri) return () => undefined
+    const { getCurrentWindow } = await import('@tauri-apps/api/window')
+    const win = getCurrentWindow()
+    let timer: number | null = null
+    const unlisten = await win.onResized(() => {
+      if (timer !== null) window.clearTimeout(timer)
+      timer = window.setTimeout(async () => {
+        timer = null
+        if (!shouldHide()) return
+        if (await win.isMinimized()) await win.hide()
+      }, 140)
+    })
+    return () => {
+      if (timer !== null) window.clearTimeout(timer)
+      unlisten()
+    }
   }
 }

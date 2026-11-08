@@ -1,21 +1,28 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useApp } from '../stores/app'
+import { trackIssueTitle, useApp } from '../stores/app'
 import { formatClock } from '../utils/time'
 import AppIcon from './AppIcon.vue'
 import CoverArt from './CoverArt.vue'
+import PlaybackVisualizer from './PlaybackVisualizer.vue'
+import TrackTags from './TrackTags.vue'
 
 const {
   currentTrack,
   currentCover,
   currentLyrics,
+  currentPlaybackIssue,
   state,
-  openLyricsModal,
-  openAlignment,
   openEditModal,
   pickCover,
-  pickLrc
+  updateTrackTags,
+  revalidateCurrentTrack,
+  tagHistory
 } = useApp()
+
+const issueTitle = computed(() =>
+  currentPlaybackIssue.value ? trackIssueTitle(currentPlaybackIssue.value.status) : ''
+)
 
 const fileType = computed(() => {
   const path = currentTrack.value?.filePath ?? ''
@@ -30,10 +37,9 @@ const lyricState = computed(() => {
   return { label: '歌词已同步', tone: 'ready' }
 })
 
-function startAligning(): void {
-  openAlignment(
-    currentLyrics.value.hasTimestamps ? undefined : currentTrack.value?.lyricsText || undefined
-  )
+function saveTags(tags: string[]): void {
+  if (!currentTrack.value) return
+  void updateTrackTags(currentTrack.value.id, tags)
 }
 </script>
 
@@ -47,7 +53,7 @@ function startAligning(): void {
       </span>
     </div>
 
-    <div class="cover-stage">
+    <div v-if="state.preferences.layout.showCover" class="cover-stage">
       <div class="vinyl-shadow" aria-hidden="true"></div>
       <button class="cover-button" title="更换封面" aria-label="更换封面" @click="pickCover">
         <CoverArt
@@ -79,24 +85,29 @@ function startAligning(): void {
         <span class="local-label">LOCAL</span>
       </div>
 
-      <div class="track-actions">
-        <button class="primary-button compact" @click="openLyricsModal">
-          <AppIcon name="sparkles" :size="14" />
-          找歌词
-        </button>
-        <button class="ghost-button compact" @click="startAligning">
-          <AppIcon name="align" :size="14" />
-          {{ currentLyrics.hasTimestamps ? '对轴微调' : '快速对轴' }}
-        </button>
-        <button class="icon-button subtle" title="编辑歌曲信息" aria-label="编辑歌曲信息" @click="openEditModal">
-          <AppIcon name="edit" :size="15" />
-        </button>
+      <div v-if="currentPlaybackIssue" class="track-issue">
+        <span class="issue-icon">
+          <AppIcon name="alert-triangle" :size="15" />
+        </span>
+        <span class="issue-copy">
+          <strong>{{ issueTitle }}</strong>
+          <span>{{ currentPlaybackIssue.message }}</span>
+        </span>
+        <button class="issue-retry" @click="revalidateCurrentTrack">重新检测</button>
       </div>
 
-      <button class="import-lrc-link" @click="pickLrc">
-        <AppIcon name="file-text" :size="12" />
-        已有一份 LRC？直接导入
-      </button>
+      <div v-if="state.preferences.layout.showTags" class="tags-block">
+        <div class="tags-heading">
+          <span class="tags-label">TAGS</span>
+          <button class="edit-info-link" title="编辑歌曲信息" aria-label="编辑歌曲信息" @click="openEditModal">
+            <AppIcon name="edit" :size="12" />
+            编辑信息
+          </button>
+        </div>
+        <TrackTags :tags="currentTrack.tags ?? []" :history="tagHistory" @update="saveTags" />
+      </div>
+
+      <PlaybackVisualizer v-if="state.visualizerEnabled" />
     </div>
   </section>
 </template>
@@ -146,7 +157,7 @@ function startAligning(): void {
 }
 
 .sync-ready {
-  color: rgb(200 245 106 / 78%);
+  color: var(--accent-text);
 }
 .sync-ready i {
   background: var(--accent);
@@ -178,7 +189,7 @@ function startAligning(): void {
 .cover-stage {
   position: relative;
   width: 100%;
-  max-width: 340px;
+  max-width: calc(340px * var(--cover-scale, 1));
 }
 
 .vinyl-shadow {
@@ -326,49 +337,102 @@ function startAligning(): void {
   letter-spacing: 0.1em;
 }
 
-.track-actions {
+.track-issue {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  max-width: 340px;
+  margin-top: 15px;
+  padding: 9px 10px;
+  border: 1px solid rgb(233 201 134 / 20%);
+  border-radius: 8px;
+  background: rgb(233 201 134 / 4.5%);
+}
+
+.issue-icon {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  color: var(--sand);
+}
+
+.issue-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.issue-copy strong {
+  color: var(--sand);
+  font-size: 9.5px;
+  font-weight: 560;
+}
+
+.issue-copy > span {
+  color: var(--muted);
+  font-size: 8.5px;
+  line-height: 1.55;
+}
+
+.issue-retry {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--sand);
+  font-size: 8.5px;
+  white-space: nowrap;
+  border-bottom: 1px solid rgb(233 201 134 / 28%);
+  padding-bottom: 1px;
+}
+
+.issue-retry:hover {
+  color: var(--text);
+}
+
+.tags-block {
+  width: 100%;
+  max-width: 340px;
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.tags-heading {
   display: flex;
   align-items: center;
-  gap: 7px;
-  margin-top: 24px;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
 }
 
-.track-actions .compact {
-  height: 34px;
-  padding: 0 13px;
-  font-size: 11px;
+.tags-label {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
 }
 
-.icon-button.subtle {
-  width: 34px;
-  height: 34px;
-  color: var(--muted);
-  border-color: var(--line);
-}
-
-.import-lrc-link {
-  margin-top: 15px;
+.edit-info-link {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   color: var(--faint);
-  font-size: 9.5px;
+  font-size: 9px;
   transition: color 160ms ease;
 }
 
-.import-lrc-link:hover {
+.edit-info-link:hover {
   color: var(--muted);
 }
 
 @media (max-width: 1160px) {
   .format-badge {
     font-size: 7px;
-  }
-  .track-actions {
-    flex-wrap: wrap;
-  }
-  .track-actions .ghost-button.compact {
-    padding: 0 10px;
   }
 }
 
@@ -401,11 +465,8 @@ function startAligning(): void {
   .track-subline {
     margin-top: 9px;
   }
-  .track-actions {
+  .tags-block {
     margin-top: 15px;
-  }
-  .import-lrc-link {
-    margin-top: 10px;
   }
 }
 </style>

@@ -11,6 +11,7 @@ import {
   timedLineCount,
   withAdjustedLine
 } from '../utils/lrc'
+import { shortcutCodeMatches, shortcutMatches } from '../utils/shortcuts'
 import { clamp, formatLyricTime } from '../utils/time'
 import AppIcon from './AppIcon.vue'
 import CoverArt from './CoverArt.vue'
@@ -39,6 +40,8 @@ const compensation = ref(state.settings.compensationMs ?? -150)
 const history = ref<HistoryEntry[]>([])
 const listEl = ref<HTMLElement | null>(null)
 const rowEls = ref<HTMLElement[]>([])
+const scrubberEl = ref<HTMLElement | null>(null)
+let scrubbing = false
 const writeSidecar = ref(false)
 const offsetInput = ref<number>(0)
 const saving = ref(false)
@@ -219,9 +222,48 @@ function selectRow(index: number, line: AlignLine): void {
   void seekTo(0)
 }
 
-function onScrubInput(event: Event): void {
-  const target = Number((event.target as HTMLInputElement).value)
-  void seekTo(target)
+function seekFromPointer(clientX: number): void {
+  const element = scrubberEl.value
+  if (!element || state.duration <= 0) return
+  const rect = element.getBoundingClientRect()
+  if (rect.width <= 0) return
+  const ratio = clamp((clientX - rect.left) / rect.width, 0, 1)
+  void seekTo(ratio * state.duration)
+}
+
+function startScrubbing(event: PointerEvent): void {
+  if (event.button !== 0) return
+  event.preventDefault()
+  scrubbing = true
+  const element = event.currentTarget as HTMLElement
+  try {
+    element.setPointerCapture(event.pointerId)
+  } catch {
+    // Pointer capture is best-effort; dragging still works without it.
+  }
+  seekFromPointer(event.clientX)
+}
+
+function moveScrubbing(event: PointerEvent): void {
+  if (!scrubbing) return
+  seekFromPointer(event.clientX)
+}
+
+function endScrubbing(event: PointerEvent): void {
+  if (!scrubbing) return
+  scrubbing = false
+  const element = event.currentTarget as HTMLElement
+  try {
+    element.releasePointerCapture(event.pointerId)
+  } catch {
+    // Ignore a lost pointer capture.
+  }
+  seekFromPointer(event.clientX)
+}
+
+function nudgeSeek(deltaSeconds: number): void {
+  if (state.duration <= 0) return
+  void seekTo(clamp(state.position + deltaSeconds, 0, state.duration))
 }
 
 function showHint(message: string): void {
@@ -347,37 +389,37 @@ function onKeydown(event: KeyboardEvent): void {
   }
   if (isEditable) return
 
-  const code = event.code
-  if (event.repeat && ['Space', 'KeyP', 'KeyR', 'KeyS', 'KeyZ'].includes(code)) return
+  const shortcuts = state.preferences.shortcuts
+  const repeated = event.repeat
 
-  if (code === 'Space') {
+  if (shortcutMatches(event, shortcuts.alignMark)) {
     event.preventDefault()
-    stampCurrentLine()
+    if (!repeated) stampCurrentLine()
     return
   }
-  if (code === 'KeyP') {
+  if (shortcutMatches(event, shortcuts.alignPause)) {
     event.preventDefault()
-    void togglePlay()
+    if (!repeated) void togglePlay()
     return
   }
-  if (code === 'KeyR' && !event.ctrlKey && !event.metaKey) {
+  if (shortcutMatches(event, shortcuts.alignRewind)) {
     event.preventDefault()
-    rewind()
+    if (!repeated) rewind()
     return
   }
-  if (code === 'KeyZ') {
+  if (shortcutMatches(event, shortcuts.alignUndo)) {
     event.preventDefault()
-    undo()
+    if (!repeated) undo()
     return
   }
-  if (code === 'KeyS') {
+  if (shortcutMatches(event, shortcuts.alignSave)) {
     event.preventDefault()
-    void saveLyrics()
+    if (!repeated) void saveLyrics()
     return
   }
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+  if (shortcutCodeMatches(event, shortcuts.alignBack) || shortcutCodeMatches(event, shortcuts.alignForward)) {
     event.preventDefault()
-    const direction = event.key === 'ArrowLeft' ? -1 : 1
+    const direction = shortcutCodeMatches(event, shortcuts.alignBack) ? -1 : 1
     const delta = event.ctrlKey || event.metaKey ? 500 : event.shiftKey ? 10 : 100
     adjustCurrent(direction * delta)
   }
@@ -592,19 +634,32 @@ onBeforeUnmount(() => {
             <small>/ {{ formatLyricTime(state.duration * 1000) }}</small>
           </div>
           <div class="progress-wrap">
-            <input
-              class="range align-range"
-              type="range"
-              min="0"
-              :max="state.duration || 1"
-              step="0.05"
-              :value="state.position"
+            <div
+              ref="scrubberEl"
+              class="align-scrubber"
+              role="slider"
+              tabindex="0"
               aria-label="播放进度"
-              :style="{ '--align-progress': `${progressPercent}%` }"
-              @input="onScrubInput"
-            />
-            <div class="marker-layer" aria-hidden="true">
-              <span v-for="(marker, index) in markers" :key="index" :style="{ left: `${marker}%` }"></span>
+              aria-orientation="horizontal"
+              :aria-valuemin="0"
+              :aria-valuemax="Math.round(state.duration)"
+              :aria-valuenow="Math.round(state.position)"
+              @pointerdown="startScrubbing"
+              @pointermove="moveScrubbing"
+              @pointerup="endScrubbing"
+              @pointercancel="endScrubbing"
+              @keydown.left.prevent="nudgeSeek(-5)"
+              @keydown.right.prevent="nudgeSeek(5)"
+              @keydown.home.prevent="nudgeSeek(-state.duration)"
+              @keydown.end.prevent="nudgeSeek(state.duration)"
+            >
+              <div class="scrubber-track">
+                <span class="scrubber-fill" :style="{ width: `${progressPercent}%` }"></span>
+                <span class="scrubber-thumb" :style="{ left: `${progressPercent}%` }"></span>
+              </div>
+              <div class="scrubber-markers" aria-hidden="true">
+                <span v-for="(marker, index) in markers" :key="index" :style="{ left: `${marker}%` }"></span>
+              </div>
             </div>
           </div>
           <div class="playback-controls">
@@ -722,6 +777,26 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .align-screen {
+  /* Keep the quick aligner a dark focus workspace when the app is in light mode. */
+  --bg: #0c0e0b;
+  --bg-raised: #121410;
+  --surface: #171a15;
+  --surface-bright: #1c2019;
+  --text-bright: #f3f5ec;
+  --text: #e4e7dc;
+  --muted: #989f90;
+  --faint: #5f665b;
+  --accent: #c8f56a;
+  --accent-strong: #d8ff86;
+  --accent-soft: rgb(200 245 106 / 8%);
+  --accent-text: #c8f56a;
+  --on-accent: #11140e;
+  --sand: #e9c986;
+  --line: rgb(255 255 255 / 7%);
+  --line-strong: rgb(255 255 255 / 12%);
+  --surface-soft: rgb(255 255 255 / 3%);
+  --surface-hover: rgb(255 255 255 / 6%);
+  color-scheme: dark;
   position: fixed;
   inset: 0;
   z-index: 50;
@@ -781,7 +856,7 @@ onBeforeUnmount(() => {
 }
 
 .eyebrow {
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--font-mono);
   font-size: 7px;
   font-weight: 600;
@@ -887,7 +962,7 @@ onBeforeUnmount(() => {
 }
 
 .top-save {
-  color: #11140e;
+  color: var(--on-accent);
   background: var(--accent);
   font-weight: 560;
 }
@@ -951,7 +1026,7 @@ kbd {
 }
 
 .restore-icon {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .restore-banner p {
@@ -959,7 +1034,7 @@ kbd {
 }
 
 .restore-banner button {
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 9px;
 }
 
@@ -1043,7 +1118,7 @@ kbd {
 }
 
 .align-row.current .row-index {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .row-time {
@@ -1096,7 +1171,7 @@ kbd {
 }
 
 .cursor-label {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 
 .cursor-label i {
@@ -1122,7 +1197,7 @@ kbd {
 
 @keyframes stamp-flash {
   0% {
-    color: var(--accent);
+    color: var(--accent-text);
     text-shadow: 0 0 14px rgb(200 245 106 / 60%);
   }
   100% {
@@ -1180,7 +1255,7 @@ kbd {
   height: 25px;
   border-radius: 50%;
   border: 1px solid rgb(200 245 106 / 20%);
-  border-top-color: var(--accent);
+  border-top-color: var(--accent-text);
   animation: spin 1s linear infinite;
 }
 
@@ -1297,61 +1372,78 @@ kbd {
 }
 
 .progress-wrap {
+  margin-top: 9px;
+}
+
+.align-scrubber {
   position: relative;
-  margin-top: 11px;
-  padding-bottom: 2px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  border-radius: 4px;
 }
 
-.align-range {
+.align-scrubber:focus-visible {
+  outline: none;
+}
+
+.align-scrubber:focus-visible .scrubber-track {
+  box-shadow: 0 0 0 3px rgb(200 245 106 / 12%);
+}
+
+.scrubber-track {
   position: relative;
-  z-index: 2;
-  height: 12px;
-}
-
-.align-range::-webkit-slider-runnable-track {
+  width: 100%;
   height: 2px;
-  background: linear-gradient(
-    to right,
-    var(--accent) 0,
-    var(--accent) var(--align-progress),
-    rgb(255 255 255 / 8%) var(--align-progress),
-    rgb(255 255 255 / 8%) 100%
-  );
+  border-radius: 2px;
+  background: rgb(255 255 255 / 9%);
 }
 
-.align-range::-webkit-slider-thumb {
-  width: 8px;
-  height: 8px;
-  margin-top: -3px;
-  opacity: 1;
-}
-
-.align-range::-moz-range-track {
-  height: 2px;
-  background: rgb(255 255 255 / 8%);
-}
-
-.align-range::-moz-range-progress {
-  height: 2px;
+.scrubber-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: inherit;
   background: var(--accent);
 }
 
-.marker-layer {
+.scrubber-thumb {
   position: absolute;
-  left: 4px;
-  right: 4px;
-  top: 5px;
-  height: 2px;
-  overflow: hidden;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 4px rgb(200 245 106 / 10%);
   pointer-events: none;
-  z-index: 1;
+  z-index: 3;
 }
 
-.marker-layer span {
+.align-scrubber:hover .scrubber-thumb {
+  box-shadow: 0 0 0 5px rgb(200 245 106 / 15%);
+}
+
+.scrubber-markers {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.scrubber-markers span {
   position: absolute;
   width: 1px;
   height: 2px;
-  background: rgb(255 255 255 / 25%);
+  background: rgb(255 255 255 / 30%);
 }
 
 .playback-controls {
@@ -1385,7 +1477,7 @@ kbd {
   width: 34px;
   height: 34px;
   border-radius: 50%;
-  color: #11140e;
+  color: var(--on-accent);
   background: var(--accent);
   box-shadow: 0 4px 14px rgb(200 245 106 / 10%);
 }
@@ -1432,7 +1524,7 @@ kbd {
   border-radius: 5px;
   background: rgb(200 245 106 / 12%);
   border: 1px solid rgb(200 245 106 / 18%);
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--font-mono);
   font-size: 7px;
   font-weight: 600;
@@ -1606,7 +1698,7 @@ kbd {
 }
 
 .preset-row button.active {
-  color: var(--accent);
+  color: var(--accent-text);
   border-color: rgb(200 245 106 / 15%);
   background: rgb(200 245 106 / 5%);
 }
@@ -1656,7 +1748,7 @@ kbd {
 }
 
 .apply-offset:hover:not(:disabled) {
-  color: var(--accent);
+  color: var(--accent-text);
   border-color: rgb(200 245 106 / 20%);
 }
 
@@ -1723,7 +1815,7 @@ kbd {
 .sidecar-check input:checked + .checkbox-mark {
   color: #13160e;
   background: var(--accent);
-  border-color: var(--accent);
+  border-color: var(--accent-text);
 }
 
 .sidecar-check > span:last-child {

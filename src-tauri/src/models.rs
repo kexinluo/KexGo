@@ -13,6 +13,12 @@ pub struct Track {
     pub lrc_path: Option<String>,
     pub lyrics_text: String,
     pub lyrics_origin: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub play_count: u64,
+    #[serde(default)]
+    pub pause_fade: bool,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -28,6 +34,24 @@ pub struct AppSettings {
     pub volume: f32,
     #[serde(default = "default_compensation")]
     pub compensation_ms: i32,
+    #[serde(default)]
+    pub queue: Option<Vec<String>>,
+    #[serde(default = "default_play_mode")]
+    pub play_mode: String,
+    #[serde(default = "default_sort_mode")]
+    pub sort_mode: String,
+    #[serde(default)]
+    pub library_order: Vec<String>,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+    #[serde(default = "default_lyrics_font_size")]
+    pub lyrics_font_size: i32,
+    #[serde(default = "default_visualizer_enabled")]
+    pub visualizer_enabled: bool,
+    #[serde(default)]
+    pub preferences: serde_json::Value,
 }
 
 fn default_volume() -> f32 {
@@ -38,6 +62,30 @@ fn default_compensation() -> i32 {
     -150
 }
 
+fn default_play_mode() -> String {
+    "sequential".to_string()
+}
+
+fn default_sort_mode() -> String {
+    "custom".to_string()
+}
+
+fn default_theme() -> String {
+    "dark".to_string()
+}
+
+fn default_close_to_tray() -> bool {
+    true
+}
+
+fn default_lyrics_font_size() -> i32 {
+    15
+}
+
+fn default_visualizer_enabled() -> bool {
+    false
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -45,6 +93,15 @@ impl Default for AppSettings {
             last_position: 0.0,
             volume: 0.78,
             compensation_ms: -150,
+            queue: None,
+            play_mode: default_play_mode(),
+            sort_mode: default_sort_mode(),
+            library_order: Vec::new(),
+            theme: default_theme(),
+            close_to_tray: default_close_to_tray(),
+            lyrics_font_size: default_lyrics_font_size(),
+            visualizer_enabled: default_visualizer_enabled(),
+            preferences: serde_json::json!({}),
         }
     }
 }
@@ -117,6 +174,37 @@ pub struct SaveLyricsResult {
 pub struct SaveLyricsResponse {
     pub track: Track,
     pub result: SaveLyricsResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackIssue {
+    pub track_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackCheck {
+    pub status: String,
+    pub message: String,
+}
+
+impl TrackCheck {
+    pub fn ok() -> Self {
+        Self {
+            status: "ok".to_string(),
+            message: String::new(),
+        }
+    }
+
+    pub fn issue(status: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: status.to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

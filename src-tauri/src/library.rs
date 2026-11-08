@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::models::{
     AppSettings, ImportFailure, ImportSummary, LibraryFile, LibrarySnapshot, SaveLyricsResponse,
-    SaveLyricsResult, Track,
+    SaveLyricsResult, Track, TrackCheck, TrackIssue,
 };
 
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "wav", "ogg", "opus"];
@@ -79,6 +79,41 @@ impl LibraryStore {
         }
     }
 
+    /// Cheap startup check: path presence/readability and known unsupported
+    /// containers only. Decoding and duration probing happen before playback.
+    pub fn validate_library_paths(&self) -> Vec<TrackIssue> {
+        self.tracks
+            .iter()
+            .filter_map(|track| {
+                let path = Path::new(&track.file_path);
+                let issue = if !path.exists() {
+                    Some((
+                        "missing",
+                        "文件不存在或已被移动，请重新导入或从曲库移除。".to_string(),
+                    ))
+                } else if !path.is_file() {
+                    Some(("missing", "该路径不是音频文件。".to_string()))
+                } else if fs::File::open(path).is_err() {
+                    Some((
+                        "unreadable",
+                        "无法读取该文件，请检查文件权限或磁盘状态。".to_string(),
+                    ))
+                } else if let Some(reason) = unsupported_container_reason(path) {
+                    Some(("unsupported", reason))
+                } else if fs::metadata(path).map(|meta| meta.len()).unwrap_or(0) == 0 {
+                    Some(("undecodable", "文件为空或已损坏。".to_string()))
+                } else {
+                    None
+                };
+                issue.map(|(status, message)| TrackIssue {
+                    track_id: track.id.clone(),
+                    status: status.to_string(),
+                    message,
+                })
+            })
+            .collect()
+    }
+
     pub fn persist(&self) -> Result<(), String> {
         let file = LibraryFile {
             tracks: self.tracks.clone(),
@@ -119,6 +154,46 @@ impl LibraryStore {
         };
         track.album = album.trim().to_string();
         track.updated_at = now;
+        let updated = track.clone();
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub fn set_track_tags(&mut self, track_id: &str, tags: Vec<String>) -> Result<Track, String> {
+        let normalized = normalize_tags(tags);
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        track.tags = normalized;
+        track.updated_at = now_ms();
+        let updated = track.clone();
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub fn set_track_pause_fade(&mut self, track_id: &str, enabled: bool) -> Result<Track, String> {
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        track.pause_fade = enabled;
+        track.updated_at = now_ms();
+        let updated = track.clone();
+        self.persist()?;
+        Ok(updated)
+    }
+
+    pub fn increment_play_count(&mut self, track_id: &str) -> Result<Track, String> {
+        let track = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| "歌曲不存在".to_string())?;
+        track.play_count = track.play_count.saturating_add(1);
+        track.updated_at = now_ms();
         let updated = track.clone();
         self.persist()?;
         Ok(updated)
@@ -171,6 +246,13 @@ impl LibraryStore {
                         reason: "不是受支持的音频文件".to_string(),
                     });
                 }
+                continue;
+            }
+            if let Some(reason) = unsupported_container_reason(&path) {
+                summary.failed.push(ImportFailure {
+                    path: path.to_string_lossy().to_string(),
+                    reason,
+                });
                 continue;
             }
             let normalized = path.to_string_lossy().to_string();
@@ -279,6 +361,9 @@ impl LibraryStore {
             } else {
                 "unknown".to_string()
             },
+            tags: Vec::new(),
+            play_count: 0,
+            pause_fade: false,
             created_at: now,
             updated_at: now,
         };
@@ -539,6 +624,243 @@ pub fn probe_duration(path: &Path) -> Option<f64> {
     Some(time.seconds as f64 + time.frac)
 }
 
+/// Reject fragmented MP4 files before they enter the player.
+///
+/// The import dialog and the player previously relied on the file extension.
+/// A fragmented MP4 renamed to `.mp3` can have a zero `mdhd` duration and can
+/// crash some decoder paths, so detect it up front and return a human-readable
+/// reason instead of trying to decode it.
+pub fn unsupported_container_reason(path: &Path) -> Option<String> {
+    if !is_fragmented_mp4(path) {
+        return None;
+    }
+    Some(
+        "检测到该文件实际是 fragmented MP4（分片 MP4，常见音轨为 AAC），不是普通的 MP3/M4A 文件。当前版本暂不支持分片 MP4，已停止导入和播放以避免闪退。请先将它转换为普通 M4A 或 MP3 后再导入。"
+            .to_string(),
+    )
+}
+
+struct IsoBoxHeader {
+    kind: [u8; 4],
+    header_size: u64,
+    size: u64,
+}
+
+fn read_iso_box_header(file: &mut fs::File, pos: u64, limit: u64) -> Option<IsoBoxHeader> {
+    if pos.checked_add(8)? > limit {
+        return None;
+    }
+    file.seek(SeekFrom::Start(pos)).ok()?;
+    let mut header = [0u8; 16];
+    let available = (limit - pos).min(header.len() as u64) as usize;
+    file.read_exact(&mut header[..available]).ok()?;
+
+    let size32 = u32::from_be_bytes(header[0..4].try_into().ok()?);
+    let kind: [u8; 4] = header[4..8].try_into().ok()?;
+    let (header_size, size) = if size32 == 1 {
+        if available < 16 {
+            return None;
+        }
+        let size64 = u64::from_be_bytes(header[8..16].try_into().ok()?);
+        (16u64, size64)
+    } else if size32 == 0 {
+        (8u64, limit - pos)
+    } else {
+        (8u64, u64::from(size32))
+    };
+
+    if size < header_size || pos.checked_add(size)? > limit {
+        return None;
+    }
+    Some(IsoBoxHeader {
+        kind,
+        header_size,
+        size,
+    })
+}
+
+fn moov_contains_mvex(file: &mut fs::File, start: u64, length: u64) -> bool {
+    let end = start.saturating_add(length);
+    let mut pos = start;
+    let mut boxes = 0usize;
+    while boxes < 100_000 {
+        let Some(header) = read_iso_box_header(file, pos, end) else {
+            break;
+        };
+        if &header.kind == b"mvex" {
+            return true;
+        }
+        pos = pos.saturating_add(header.size);
+        boxes += 1;
+    }
+    false
+}
+
+fn is_fragmented_mp4(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(file_len) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    if file_len < 12 {
+        return false;
+    }
+
+    let mut prefix = [0u8; 16];
+    let available = (file_len.min(prefix.len() as u64)) as usize;
+    if file.read_exact(&mut prefix[..available]).is_err() {
+        return false;
+    }
+    let first_kind = &prefix[4..8];
+    if first_kind == b"styp" {
+        // A standalone fMP4 media segment has no moov/mvex. It is not a file
+        // that the current decoder can play on its own.
+        return true;
+    }
+    if first_kind != b"ftyp" {
+        return false;
+    }
+
+    let mut pos = 0u64;
+    let mut boxes = 0usize;
+    while pos < file_len && boxes < 100_000 {
+        let Some(header) = read_iso_box_header(&mut file, pos, file_len) else {
+            break;
+        };
+        if &header.kind == b"moof" || &header.kind == b"styp" {
+            return true;
+        }
+        if &header.kind == b"moov"
+            && moov_contains_mvex(
+                &mut file,
+                pos + header.header_size,
+                header.size - header.header_size,
+            )
+        {
+            return true;
+        }
+        pos = pos.saturating_add(header.size);
+        boxes += 1;
+    }
+    false
+}
+
+/// Full validation before a track is handed to the audio engine.
+pub fn check_audio_file(path: &Path, stored_duration: f64) -> TrackCheck {
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    if !path.is_file() {
+        return TrackCheck::issue("missing", "文件不存在或已被移动，请重新导入或从曲库移除。");
+    }
+    if let Some(reason) = unsupported_container_reason(path) {
+        return TrackCheck::issue("unsupported", reason);
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            return TrackCheck::issue(
+                "unreadable",
+                "无法读取该文件，请检查文件权限或磁盘状态。",
+            );
+        }
+    };
+    let source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut probed = match symphonia::default::get_probe().format(
+        &hint,
+        source,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    ) {
+        Ok(probed) => probed,
+        Err(error) => {
+            return TrackCheck::issue(
+                "undecodable",
+                format!("无法解码此文件，可能已损坏或格式不受支持（{error}）。"),
+            );
+        }
+    };
+
+    let Some(track) = probed.format.default_track() else {
+        return TrackCheck::issue("undecodable", "文件中没有可解码的音轨。");
+    };
+    let track_id = track.id;
+    let codec = track.codec_params.codec;
+    let codec_params = track.codec_params.clone();
+    if codec == CODEC_TYPE_NULL {
+        return TrackCheck::issue("undecodable", "文件中没有受支持的音频编码。");
+    }
+
+    let probed_duration = codec_params
+        .time_base
+        .as_ref()
+        .zip(codec_params.n_frames.as_ref())
+        .map(|(timebase, frames)| {
+            let time = timebase.calc_time(*frames);
+            time.seconds as f64 + time.frac
+        })
+        .unwrap_or(0.0);
+    if probed_duration <= 0.0 && stored_duration <= 0.0 {
+        return TrackCheck::issue(
+            "duration-unknown",
+            "无法探测音频时长，播放和对轴暂不可用。",
+        );
+    }
+
+    let mut decoder = match symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+    {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            return TrackCheck::issue("undecodable", format!("无法创建音频解码器：{error}"));
+        }
+    };
+
+    let mut decoded_any = false;
+    let mut decode_errors = 0usize;
+    for _ in 0..64 {
+        let packet = match probed.format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(_) => {
+                decoded_any = true;
+                break;
+            }
+            Err(SymphoniaError::DecodeError(_)) => {
+                decode_errors += 1;
+                if decode_errors > 8 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    if !decoded_any {
+        return TrackCheck::issue(
+            "undecodable",
+            "无法解码音频数据，文件可能已损坏或编码格式不受支持。",
+        );
+    }
+
+    TrackCheck::ok()
+}
+
 pub fn read_text_any_encoding(path: &Path) -> Result<String, String> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -684,9 +1006,129 @@ fn paths_equal(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::new();
+    for raw in tags {
+        let tag = raw.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        let tag = tag.chars().take(24).collect::<String>();
+        if normalized
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&tag))
+        {
+            continue;
+        }
+        normalized.push(tag);
+        if normalized.len() >= 20 {
+            break;
+        }
+    }
+    normalized
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_TEMP_FILE: AtomicU32 = AtomicU32::new(0);
+
+    fn iso_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(payload.len() + 8);
+        bytes.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn temp_audio_file(bytes: &[u8]) -> PathBuf {
+        let id = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("kexgo-test-{}-{id}.bin", std::process::id()));
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn detects_fragmented_mp4() {
+        let mut bytes = iso_box(b"ftyp", b"isom\0\0\0\0isom");
+        bytes.extend(iso_box(b"moov", &iso_box(b"mvex", &[])));
+        bytes.extend(iso_box(b"moof", &[]));
+        let path = temp_audio_file(&bytes);
+        assert!(is_fragmented_mp4(&path));
+        assert!(unsupported_container_reason(&path).is_some());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn allows_regular_mp4() {
+        let mut bytes = iso_box(b"ftyp", b"isom\0\0\0\0isom");
+        bytes.extend(iso_box(b"moov", &iso_box(b"mvhd", &[])));
+        bytes.extend(iso_box(b"mdat", &[0, 0, 0, 0]));
+        let path = temp_audio_file(&bytes);
+        assert!(!is_fragmented_mp4(&path));
+        assert!(unsupported_container_reason(&path).is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn allows_regular_audio() {
+        let path = temp_audio_file(b"ID3\x04\x00\x00\x00\x00\x00\x00");
+        assert!(!is_fragmented_mp4(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn detects_standalone_fragment_segment() {
+        let path = temp_audio_file(&iso_box(b"styp", b"msdh\0\0\0\0msdhmsix"));
+        assert!(is_fragmented_mp4(&path));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn normalizes_tags() {
+        let tags = normalize_tags(vec![
+            " 夜晚 ".to_string(),
+            "独立".to_string(),
+            "夜晚".to_string(),
+            "".to_string(),
+            "这是一个超过二十四个字符限制的标签名称会被截断处理".to_string(),
+        ]);
+        assert_eq!(tags[0], "夜晚");
+        assert_eq!(tags[1], "独立");
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[2].chars().count(), 24);
+    }
+
+    #[test]
+    fn check_audio_file_reports_missing_paths() {
+        let path = std::env::temp_dir().join(format!(
+            "kexgo-missing-{}-{}.mp3",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = check_audio_file(&path, 0.0);
+        assert_eq!(result.status, "missing");
+    }
+
+    #[test]
+    fn check_audio_file_reports_fragmented_mp4_before_decoding() {
+        let mut bytes = iso_box(b"ftyp", b"isom\0\0\0\0isom");
+        bytes.extend(iso_box(b"moov", &iso_box(b"mvex", &[])));
+        let path = temp_audio_file(&bytes);
+        let result = check_audio_file(&path, 0.0);
+        assert_eq!(result.status, "unsupported");
+        let _ = fs::remove_file(path);
+    }
 }

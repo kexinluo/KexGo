@@ -6,11 +6,20 @@ import AppIcon from './AppIcon.vue'
 import CoverArt from './CoverArt.vue'
 
 const emit = defineEmits<{ (event: 'close'): void }>()
-const { state, currentTrack, currentCover, updateMetadata, removeTrack, pickCover } = useApp()
+const {
+  state,
+  currentTrack,
+  currentCover,
+  updateMetadata,
+  removeTrack,
+  pickCover,
+  setTrackPauseFade
+} = useApp()
 
 const title = ref(currentTrack.value?.title ?? '')
 const artist = ref(currentTrack.value?.artist ?? '')
 const album = ref(currentTrack.value?.album ?? '')
+const fadeEnabled = ref(Boolean(currentTrack.value?.pauseFade))
 const saving = ref(false)
 const removing = ref(false)
 const confirmingRemove = ref(false)
@@ -36,6 +45,9 @@ async function save(): Promise<void> {
       artist: artist.value.trim() || '未知歌手',
       album: album.value.trim()
     })
+    if (fadeEnabled.value !== Boolean(currentTrack.value.pauseFade)) {
+      await setTrackPauseFade(currentTrack.value.id, fadeEnabled.value)
+    }
     emit('close')
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '保存失败'
@@ -117,6 +129,22 @@ onBeforeUnmount(() => {
                 <span>专辑 <small>可选</small></span>
                 <input v-model="album" type="text" maxlength="120" autocomplete="off" placeholder="未填写" />
               </label>
+              <div class="fade-row">
+                <div>
+                  <strong>暂停淡出</strong>
+                  <span>仅对此曲覆盖全局暂停策略</span>
+                </div>
+                <button
+                  class="fade-switch"
+                  :class="{ on: fadeEnabled }"
+                  role="switch"
+                  :aria-checked="fadeEnabled"
+                  aria-label="此曲暂停淡出"
+                  @click="fadeEnabled = !fadeEnabled"
+                >
+                  <span></span>
+                </button>
+              </div>
 
               <div class="track-facts">
                 <div>
@@ -172,7 +200,7 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgb(4 5 4 / 72%);
+  background: var(--overlay-bg);
   backdrop-filter: blur(13px);
 }
 
@@ -180,7 +208,7 @@ onBeforeUnmount(() => {
   width: min(680px, calc(100vw - 36px));
   max-height: calc(100vh - 40px);
   overflow-y: auto;
-  background: #141713;
+  background: var(--panel-bg);
   border: 1px solid var(--line-strong);
   border-radius: 18px;
   box-shadow: 0 40px 120px rgb(0 0 0 / 60%);
@@ -195,7 +223,7 @@ onBeforeUnmount(() => {
 }
 
 .eyebrow {
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--font-mono);
   font-size: 8px;
   font-weight: 600;
@@ -307,6 +335,55 @@ onBeforeUnmount(() => {
 .formal-field input:focus {
   border-color: rgb(200 245 106 / 25%);
 }
+
+.fade-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+}
+
+.fade-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.fade-row strong {
+  color: var(--text);
+  font-size: 9px;
+  font-weight: 520;
+}
+
+.fade-row span {
+  color: var(--faint);
+  font-size: 8px;
+}
+
+.fade-switch {
+  position: relative;
+  width: 34px;
+  height: 19px;
+  flex: 0 0 auto;
+  border-radius: 10px;
+  background: var(--line-strong);
+}
+
+.fade-switch span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform 160ms ease, background 160ms ease;
+}
+
+.fade-switch.on { background: var(--accent); }
+.fade-switch.on span { background: var(--on-accent); transform: translateX(15px); }
 
 .track-facts {
   display: grid;

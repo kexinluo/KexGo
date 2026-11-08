@@ -32,6 +32,9 @@ export function createDemoTrack(): Track {
     lrcPath: 'demo-managed.lrc',
     lyricsText: demoLyrics,
     lyricsOrigin: 'lrclib',
+    tags: ['夜晚', '独立'],
+    playCount: 0,
+    pauseFade: false,
     createdAt: Date.now(),
     updatedAt: Date.now()
   }

@@ -164,7 +164,7 @@ const { isBrowser } = useApp()
 .note-b {
   left: 7%;
   bottom: 19%;
-  color: var(--accent);
+  color: var(--accent-text);
   transform: rotate(-7deg);
   width: 27px;
   height: 27px;
@@ -193,7 +193,7 @@ const { isBrowser } = useApp()
 }
 
 .eyebrow {
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--font-mono);
   font-size: 8.5px;
   font-weight: 600;
