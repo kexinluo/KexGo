@@ -313,20 +313,9 @@ pub fn restore_custom_css(state: State<'_, AppState>) -> Result<(), String> {
     std::fs::write(path, last_good).map_err(|error| format!("无法回滚自定义 CSS：{error}"))
 }
 
-fn safe_track_id(track_id: &str) -> Result<(), String> {
-    if track_id.is_empty()
-        || !track_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
-    {
-        return Err("歌曲 ID 无效".to_string());
-    }
-    Ok(())
-}
-
 fn notes_path(data_dir: &std::path::Path, track_id: &str) -> Result<PathBuf, String> {
-    safe_track_id(track_id)?;
-    Ok(data_dir.join("notes").join(format!("{track_id}.json")))
+    let safe = safe_track_id(track_id)?;
+    Ok(data_dir.join("notes").join(format!("{safe}.json")))
 }
 
 #[tauri::command]
